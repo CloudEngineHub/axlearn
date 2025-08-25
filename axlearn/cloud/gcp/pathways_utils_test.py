@@ -77,7 +77,8 @@ class PathwaysReplicatedJobTest(TestCase):
             pod_spec = pod["spec"]
 
             self.assertEqual(len(pod_spec["containers"]), 1)
-            self.assertEqual(len(pod_spec["initContainers"]), 2)
+            # pathways-proxy, pathways-rm and output-uploader
+            self.assertEqual(len(pod_spec["initContainers"]), 3)
             node_selector = pod_spec["nodeSelector"]
             self.assertEqual(
                 _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
@@ -204,8 +205,7 @@ class PathwaysReplicatedJobTest(TestCase):
         """Tests processing of pathways_xla_flags, including overrides and new flags."""
         flag_to_override_key = "xla_tpu_enable_latency_hiding_scheduler"
         override_value_str = "false"
-        # This flag's default value for v5p is "true" (string). Change it to False (bool).
-        expected_override_value_parsed = False
+        expected_override_value_parsed = "false"
 
         new_xla_flag_key = "xla_a_brand_new_one"
         new_xla_flag_value_str = "12345"

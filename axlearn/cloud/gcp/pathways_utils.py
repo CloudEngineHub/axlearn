@@ -73,17 +73,15 @@ _PATHWAYS_BACK_OFF_LIMIT = 32
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
-    """Attempts to convert an XLA flag string value to int, then bool.
+    """Attempts to convert an XLA flag string value to int.
 
     If conversion fails, returns the original string (stripped).
     """
-    bool_mapper = {"true": True, "false": False}
     stripped_value_str = value.strip()
     try:
         return int(stripped_value_str)
     except ValueError:
-        # Not an integer, try boolean conversion.
-        return bool_mapper.get(stripped_value_str.lower(), stripped_value_str)
+        return stripped_value_str
 
 
 def get_pathways_tpu_version(gke_machine_type: str) -> str:
@@ -346,10 +344,6 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         ]
         cmd_args.extend(xla_flags_from_options(self._xla_options).split())
 
-        # This is required for GKE Workload Identity and Mac Jax Client support.
-        # TODO(samos123): Remove this once this becomes the default.
-        proxy_env = [{"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "true"}]
-
         return [
             dict(
                 name=_PATHWAYS_PROXY_CONTAINER_NAME,
@@ -358,8 +352,14 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 # SideCar container is an init container with restartPolicy as "Always".
                 restartPolicy="Always",
                 args=cmd_args,
-                env=proxy_env,
+                env=[
+                    # This is required for GKE Workload Identity and Mac Jax Client support.
+                    # TODO(samos123): Remove this once this becomes the default.
+                    {"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "true"},
+                    {"name": "XLA_FLAGS", "value": f"--xla_dump_to=/output/{cfg.name}/xla"},
+                ],
                 ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
+                volumeMounts=[dict(name="shared-output", mountPath="/output")],
             ),
             dict(
                 name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
@@ -380,6 +380,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                     f"--instance_type={pathways_tpu_version}:{system.topology}",
                     f"--gcs_scratch_location={staging_location}",
                 ],
+                volumeMounts=[dict(name="shared-output", mountPath="/output")],
             ),
         ]
 
@@ -412,7 +413,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         }
 
         head_container = self._build_pathways_head_container()
-        init_containers = self._build_pathways_head_sidecar_containers()
+        init_containers = [
+            *self._build_pathways_head_sidecar_containers(),
+            # pylint: disable-next=protected-access
+            self._inner._build_uploader_container(),
+        ]
 
         # Hardcode metadata.google.internal ip address to avoid transient DNS resolution issue.
         metadata_host_alias = dict(

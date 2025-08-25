@@ -9,3 +9,11 @@ chex
 pytest
 wrapt
 optax
+pytype
+tensorflow
+msgpack
+portpicker
+grain
+array-record
+tensorstore
+aqtp

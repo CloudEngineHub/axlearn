@@ -327,7 +327,8 @@ class SingleReplicatedJob(BaseReplicatedJob):
             # topology so it will fail checks above. So we don't specially handle it
             # in this branch.
             raise ValueError("There should be no 1 in each topology dimension.")
-        cores_in_topology = math.prod(dims)
+        # There are two cores per chip in v5p
+        cores_in_topology = math.prod(dims) * 2
         if cores != cores_in_topology:
             raise ValueError(
                 f"custom topology {topology} doesn't match the number of cores in "
@@ -684,9 +685,12 @@ class TPUJobBuilder(SingleReplicatedJob):
 
             labels.update({"job-priority": str(spec.metadata.priority)})
             labels.update({"user-id": spec.metadata.user_id})
+            labels.update({"project-id": spec.metadata.project_id})
 
             # For job-priority to be populated to node labels when tpu-provisioner is used.
             selector.update({"job-priority": str(spec.metadata.priority)})
+
+        labels.update({"num-replicas": str(cfg.accelerator.num_replicas)})
 
         annotations.update(
             {
