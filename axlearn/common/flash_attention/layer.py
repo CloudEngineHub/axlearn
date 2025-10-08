@@ -80,7 +80,7 @@ class FlashAttention(GroupedQueryAttention):
                 f"{type(self.dropout).__module__}.{type(self.dropout).__qualname__}"
             )
         if cfg.tpu_block_size % 128 != 0:
-            raise ValueError("cfg.tpu_block_size must divide 128.")
+            raise ValueError("cfg.tpu_block_size must be divisible by 128.")
 
     def _create_layer_parameter_specs(self) -> dict[str, ParameterSpec]:
         cfg = self.config
@@ -400,6 +400,41 @@ class FlashBlockSizeModifier(ConfigModifier):
                 value = cast(FlashAttention.Config, value)
                 value.tpu_block_size = tpu_block_size
                 value.gpu_block_size = gpu_block_size
+
+        def enter_fn(_, value, default_kv):
+            return None if is_flash_config(value) else default_kv
+
+        cfg.visit(visit_fn=visit_fn, enter_fn=enter_fn)
+        return cfg
+
+
+class BackendOverrideModifier(ConfigModifier):
+    """Modifies the backend_overrides config of Flash Attention."""
+
+    @config_class
+    class Config(ConfigModifier.Config):
+        """Configures BackendOverrideModifier."""
+
+        backend_overrides: Optional[dict[str, Any]] = None
+
+    def __call__(self, cfg: ConfigBase) -> ConfigBase:
+        backend_overrides = self.config.backend_overrides
+
+        def is_flash_config(cfg):
+            return isinstance(cfg, FlashAttention.Config)
+
+        def visit_fn(_, value):
+            if is_flash_config(value):
+                value = cast(FlashAttention.Config, value)
+                if backend_overrides:
+                    # Instantiate a dict if value.backend_overrides hasn't already been set
+                    if value.backend_overrides is None:
+                        value.backend_overrides = dict()
+                    for override_key, override_value in backend_overrides.items():
+                        # Ensure we don't insert any values equal to None
+                        if override_value:
+                            # Use .update() to avoid overwriting existing overrides
+                            value.backend_overrides.update({override_key: override_value})
 
         def enter_fn(_, value, default_kv):
             return None if is_flash_config(value) else default_kv
