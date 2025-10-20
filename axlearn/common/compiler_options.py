@@ -89,9 +89,6 @@ def default_xla_options(
             xla_tpu_scoped_vmem_limit_kib=98304,
             # For megascale performance.
             xla_jf_crs_combiner_threshold_count=10,
-            # TODO(hanzhi-zhou): temporary workaround to avoid PCIe overload when using multi-slice
-            # v6e training caused by allreduce over DCN. This flag doesn't impact performance.
-            xla_tpu_iova_dma_chunk_size_bytes=1048576,
             # Disable collective matmul. Collective matmul could negatively affect performance in
             # some cases. Even in cases where collective matmul provides gains, the gains are
             # marginal on v6e due to the high arithmetic intensity.
@@ -378,6 +375,14 @@ def infer_xla_performance_flags(
     *, mesh_shape: "MeshShape", mesh_axis_names: Sequence[str], device_kind: str
 ) -> dict[str, str]:
     """Performs automatic XLA flag tuning based on mesh shape and device kind."""
+
+    logging.info(
+        "Inferring XLA flags for mesh %s (%s) and device %s",
+        mesh_shape,
+        mesh_axis_names,
+        device_kind,
+    )
+
     if device_kind == "TPU v6 lite":
         device_kind = "TPU v6e"
 
