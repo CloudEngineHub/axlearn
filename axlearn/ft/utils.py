@@ -16,6 +16,7 @@ Hostname Format:
 
 import logging
 import os
+import pathlib
 import re
 import subprocess
 import threading
@@ -33,6 +34,13 @@ DEFAULT_MANAGER_PORT = 8901
 
 # Client timeout in seconds
 DEFAULT_CLIENT_TIMEOUT = 10.0
+
+# Timeout for graceful training process termination in seconds
+GRACEFUL_TRAINING_TERMINATION_TIMEOUT = 1
+
+# Compiled regex patterns for hostname parsing
+_WORKER_ID_PATTERN = re.compile(r"^.+?-job-\d+-(\d+)\..+")
+_JOB_NAME_PATTERN = re.compile(r"^(.+?)-job-\d+-\d+\.(\1)(?:\.|$)")
 
 
 @dataclass
@@ -84,6 +92,48 @@ class TrainerProcessController:
             self.termination_requested = False
             self.termination_reason = ""
 
+    def _cleanup_tpu_lock_files(self) -> None:
+        """Clean up TPU lock files.
+
+        See: https://github.com/jax-ml/jax/issues/10192#issuecomment-1509814942
+        """
+        for lock_file in pathlib.Path("/tmp").glob("libtpu_lockfile*"):
+            try:
+                lock_file.unlink()
+                logging.info("Cleaned up stale lock file: %s", lock_file)
+            except FileNotFoundError:
+                pass  # File already removed, this is fine
+            except OSError as e:
+                logging.warning("Failed to remove TPU lock file %s: %s", lock_file, e)
+
+    def _do_terminate(self) -> bool:
+        """Execute the actual process termination sequence.
+
+        Returns:
+            bool: True if termination succeeded, False otherwise
+        """
+        self.current_process.terminate()
+        try:
+            self.current_process.wait(timeout=GRACEFUL_TRAINING_TERMINATION_TIMEOUT)
+            logging.info("Process terminated gracefully")
+            return True
+        except subprocess.TimeoutExpired:
+            pass
+
+        logging.warning("Process did not terminate gracefully, forcing kill")
+        self.current_process.kill()
+        try:
+            self.current_process.wait(timeout=5)
+            logging.info(
+                "Process killed successfully, exit code: %s", self.current_process.returncode
+            )
+        except subprocess.TimeoutExpired:
+            logging.error("Process still alive after SIGKILL, pid=%d", self.current_process.pid)
+            return False
+
+        self._cleanup_tpu_lock_files()
+        return True
+
     def terminate_training(self, reason: str = "Restart requested"):
         """Terminate the current trainer process.
 
@@ -94,19 +144,18 @@ class TrainerProcessController:
             bool: True if termination was initiated, False if no process to terminate
         """
         with self.lock:
-            if self.current_process:
-                logging.warning("Terminating trainer process: %s", reason)
-                self.termination_requested = True
-                self.termination_reason = reason
-
-                try:
-                    self.current_process.terminate()  # Send SIGTERM
-                    return True
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    logging.error("Failed to terminate process: %s", e)
-                    return False
-            else:
+            if not self.current_process:
                 logging.warning("No trainer process to terminate")
+                return False
+
+            logging.warning("Terminating trainer process: %s", reason)
+            self.termination_requested = True
+            self.termination_reason = reason
+
+            try:
+                return self._do_terminate()
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.error("Failed to terminate process: %s", e)
                 return False
 
     def check_termination_requested(self):
@@ -281,8 +330,7 @@ def get_job_name() -> str:
     hostname = hostnames[0]
 
     # Match pattern: {job_name}-job-{replica_id}-{worker_id}.{job_name}
-    pattern = r"^(.+?)-job-\d+-\d+\.(\1)(?:\.|$)"
-    match = re.match(pattern, hostname)
+    match = _JOB_NAME_PATTERN.match(hostname)
 
     if match:
         return match.group(1)
@@ -355,6 +403,29 @@ def worker_identity_to_proto(identity: WorkerIdentity) -> manager_pb2.WorkerIden
     proto_identity.replica_id = identity.replica_id
     proto_identity.worker_id = identity.worker_id
     return proto_identity
+
+
+def extract_worker_id_from_hostname(hostname: str) -> int:
+    """Extract worker ID from TPU worker hostname.
+
+    Hostnames follow the pattern: {job_name}-job-{replica_id}-{worker_id}.{job_name}
+
+    Args:
+        hostname: Worker hostname to parse
+
+    Returns:
+        Worker ID extracted from hostname
+
+    Raises:
+        ValueError: If hostname doesn't match expected pattern
+    """
+    # Match pattern: {job_name}-job-{replica_id}-{worker_id}.{job_name}
+    match = _WORKER_ID_PATTERN.match(hostname)
+
+    if match:
+        return int(match.group(1))
+
+    raise ValueError(f"Cannot extract worker_id from hostname: {hostname}")
 
 
 def worker_status_record_to_proto(record: WorkerStatusRecord) -> manager_pb2.WorkerStatusEntry:

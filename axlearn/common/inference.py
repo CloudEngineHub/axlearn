@@ -177,8 +177,11 @@ class InferenceRunner(Module):
         # N.B. Model dtypes restored from ckpt are controlled in the model cfg.
         inference_dtype: Optional[jnp.dtype] = None
 
-        # How to partition input batches. Also used for output batches.
+        # How to partition input batches.
         input_batch_partition_spec: DataPartitionType = DataPartitionType.FULL
+
+        # How to partition output batches.
+        output_batch_partition_spec: DataPartitionType = DataPartitionType.BATCH
 
     @classmethod
     def config_from_trainer(cls, trainer_cfg: SpmdTrainer.Config) -> Config:
@@ -311,7 +314,11 @@ class InferenceRunner(Module):
                 runner_output.output_batch,
                 utils.flatten_items(runner_output.summaries),
             )
-            yield {"inputs": runner_output.input_batch, "outputs": runner_output.output_batch}
+            yield {
+                "inputs": runner_output.input_batch,
+                "outputs": runner_output.output_batch,
+                "module_outputs": runner_output.module_outputs,
+            }
 
     def create_method_runner(
         self,
@@ -327,7 +334,8 @@ class InferenceRunner(Module):
             method: the method name of self.model to invoke. The method should take an
                 `input_batch` arg and return a NestedTensor. Both `input_batch` and the
                 returned value are NestedTensors containing Tensors with a leading dimension of
-                `batch_size` and will be partitioned with input_batch_partition_spec.
+                `batch_size` and will be partitioned with `input_batch_partition_spec` and
+                `output_batch_partition_spec` respectively.
             prng_key: the random key used for inference. Use restored key if None.
             drop_module_outputs: A callable that takes a path and outputs a decision of whether to
                 drop the module output at the given path, where True means we drop. By default, the
@@ -351,9 +359,32 @@ class InferenceRunner(Module):
             )
 
         with self.mesh():
+            input_partition_spec = utils.data_partition_type_to_spec(cfg.input_batch_partition_spec)
+            output_partition_spec = utils.data_partition_type_to_spec(
+                cfg.output_batch_partition_spec
+            )
+
+            def reshard_fn(x: Tensor, partition_spec: PartitionSpec) -> Tensor:
+                if partition_spec in [PartitionSpec(), PartitionSpec(None)]:
+                    return jax.lax.with_sharding_constraint(x, PartitionSpec(None))
+                elif x.ndim == 0:
+                    return jax.lax.with_sharding_constraint(x, PartitionSpec(None))
+                elif x.ndim == 1:
+                    return jax.lax.with_sharding_constraint(x, PartitionSpec(*partition_spec[:1]))
+                else:
+                    return jax.lax.with_sharding_constraint(x, partition_spec)
 
             def inference_iter(model_params, prng_key, input_batch):
-                return self._inference_iter(
+                model_params = jax.lax.with_sharding_constraint(
+                    model_params, self._inference_runner_state_partition_specs.model
+                )
+                prng_key = jax.lax.with_sharding_constraint(
+                    prng_key, self._inference_runner_state_partition_specs.prng_key
+                )
+                input_batch = jax.tree.map(
+                    lambda x: reshard_fn(x, input_partition_spec), input_batch
+                )
+                key, output, summaries, module_outputs = self._inference_iter(
                     prng_key,
                     model_params,
                     input_batch,
@@ -361,22 +392,16 @@ class InferenceRunner(Module):
                     drop_module_outputs=drop_module_outputs,
                     **kwargs,
                 )
+                return (
+                    jax.lax.with_sharding_constraint(
+                        key, self._inference_runner_state_partition_specs.prng_key
+                    ),
+                    jax.tree.map(lambda x: reshard_fn(x, output_partition_spec), output),
+                    summaries,
+                    module_outputs,
+                )
 
-            input_partition_spec = utils.data_partition_type_to_spec(cfg.input_batch_partition_spec)
-            jit_inference_iter_fn = pjit(
-                inference_iter,
-                in_shardings=(
-                    self._inference_runner_state_partition_specs.model,
-                    self._inference_runner_state_partition_specs.prng_key,
-                    input_partition_spec,  # Input batch.
-                ),
-                out_shardings=(
-                    self._inference_runner_state_partition_specs.prng_key,
-                    None,  # Output batch.
-                    None,  # Summaries.
-                    None,  # Module outputs.
-                ),
-            )
+            jit_inference_iter_fn = pjit(inference_iter)
             self.vlog(1, "jit complete for %s", method)
             prng_key = self._inference_runner_state.prng_key if prng_key is None else prng_key
 

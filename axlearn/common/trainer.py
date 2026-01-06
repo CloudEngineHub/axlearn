@@ -821,7 +821,7 @@ class SpmdTrainer(Module):
             self._step_log(msg, *args, **kwargs)
             analysis_logs.append(msg % args)
 
-        _step_log("##################### Model analysis #####################\n")
+        _step_log("##################### Model analysis #####################")
         _step_log("## Parameters:")
         fmt = "%10d %-20s %s"
         flatten_name_and_spec = flatten_items(self._model_param_specs)
@@ -832,7 +832,7 @@ class SpmdTrainer(Module):
         _step_log("Total number of model params: %s", f"{total_num_params:,}")
         self.summary_writer(0, {"num_model_params": total_num_params})
 
-        _step_log("\n## Trainer States:")
+        _step_log("## Trainer States:")
         # Training state size.
         total_state_bytes = 0
         total_sharded_state_bytes = 0
@@ -856,16 +856,15 @@ class SpmdTrainer(Module):
             max_sharded_state_gb = total_sharded_state_gb
 
         _step_log(
-            "Training state size: %.2f GiB\n"
-            "Training state size (partitioned): %.2f GiB\n"
+            "Training state size: %.2f GiB\t"
+            "Training state size (partitioned): %.2f GiB\t"
             "Max training state size (partitioned): %.2f GiB",
             total_state_bytes / 1024**3,
             total_sharded_state_gb,
             max_sharded_state_gb,
         )
-
-        _step_log("\n##########################################################")
-        return "\n".join(analysis_logs)
+        _step_log("##########################################################")
+        return "\t".join(analysis_logs)
 
     def _prepare_training(self, prng_key: Tensor) -> bool:
         """Prepares training.
@@ -959,7 +958,11 @@ class SpmdTrainer(Module):
                         step,
                         restore_input_iter,
                     )
-            except ValueError as e:
+
+            # Possible exceptions are ValueError and RuntimeError from
+            # tensorflow when tensorflow dataset iterator checkpoints are not found
+            # pylint: disable-next=broad-exception-caught
+            except Exception as e:
                 logging.warning(
                     "Attempt to restore checkpoint with restore_input_iter=%s failed: %s",
                     restore_input_iter,
@@ -1228,7 +1231,8 @@ class SpmdTrainer(Module):
             # pjit currently requires all parameters to be specified as positional args.
             lowered_train_step = jit_train_step.lower(trainer_state, input_batch)
             compiled = lowered_train_step.compile(compiler_options=compiler_options)
-            logging.log_first_n(logging.INFO, aot_model_analysis(compiled), 1)
+            for line in aot_model_analysis(compiled).split("\n"):
+                logging.info("%s", line)
             return compiled
 
     def _train_step(

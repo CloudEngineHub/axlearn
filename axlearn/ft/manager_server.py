@@ -22,11 +22,19 @@ from axlearn.ft.utils import (
     WorkerIdentity,
     WorkerStatusRecord,
     create_current_timestamp,
+    extract_worker_id_from_hostname,
     get_all_worker_hostnames,
-    get_worker_id,
+    get_num_replicas,
+    get_replica_head_hostname,
     get_worker_identity,
     worker_status_record_to_proto,
 )
+
+# Maximum parallel threads for forwarding restart requests
+MAX_RESTART_FORWARD_THREADS = 100
+
+# Maximum concurrent async termination tasks per worker
+MAX_TERMINATION_EXECUTOR_THREADS = 1  # Each worker has only 1 training process
 
 
 class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
@@ -55,6 +63,12 @@ class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
         self.server: Optional[grpc.Server] = None
         self.process_controller = process_controller
         self._registry_lock = threading.Lock()
+
+        # Thread pool for async termination tasks (bounded to prevent resource exhaustion)
+        self._termination_executor = futures.ThreadPoolExecutor(
+            max_workers=MAX_TERMINATION_EXECUTOR_THREADS,
+            thread_name_prefix="termination",
+        )
 
         # Initialize registries based on role
         if self._worker_identity.is_replica_manager:
@@ -134,10 +148,14 @@ class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
         return self.server
 
     def stop_server(self, grace_period: int = 10):
-        """Stop the gRPC server."""
+        """Stop the gRPC server and clean up resources."""
         if self.server:
             self.server.stop(grace_period)
             logging.info("Manager server stopped")
+
+        # Shutdown termination executor (wait for pending tasks to complete)
+        self._termination_executor.shutdown(wait=True)
+        logging.info("Termination executor stopped")
 
     def ReportStatus(
         self, request: manager_pb2.StatusUpdate, context
@@ -294,6 +312,26 @@ class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
             )
             raise
 
+    def _terminate_training_async(self, hostname: str, reason: str, is_shutdown: bool) -> None:
+        """Terminate training process asynchronously in background thread.
+
+        Args:
+            hostname: Worker hostname for logging
+            reason: Reason for termination
+            is_shutdown: Whether this is a shutdown (vs restart) request
+        """
+        try:
+            success = self.process_controller.terminate_training(reason)
+            if success:
+                action = "shutdown" if is_shutdown else "restart"
+                logging.info("Worker %s training %s completed", hostname, action)
+                if is_shutdown:
+                    logging.warning("Immediate shutdown requested, exiting after termination")
+            else:
+                logging.warning("Worker %s has no active training process", hostname)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.error("Async termination failed: %s", e)
+
     def RestartTraining(
         self, request: manager_pb2.RestartRequest, context
     ) -> manager_pb2.RestartResponse:
@@ -311,25 +349,28 @@ class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
 
             logging.info("Worker processing restart request")
 
-            # Attempt to terminate the trainer process
-            success = False
-            message = ""
+            # Check if this is a shutdown request (not a restart)
+            is_shutdown = request.reason.startswith("IMMEDIATE_SHUTDOWN:")
 
-            if self.process_controller:
-                success = self.process_controller.terminate_training(request.reason)
-                if success:
-                    message = f"Worker {worker_identity.hostname} training termination initiated"
-                    logging.info(message)
-                else:
-                    message = f"Worker {worker_identity.hostname} has no active training process"
-                    logging.warning(message)
-            else:
+            if not self.process_controller:
                 message = f"Worker {worker_identity.hostname} has no process controller"
                 logging.error(message)
-                success = False
+                return self._create_success_response(
+                    manager_pb2.RestartResponse, acknowledged=False, message=message
+                )
 
+            # Submit termination to thread pool - return immediately
+            self._termination_executor.submit(
+                self._terminate_training_async,
+                worker_identity.hostname,
+                request.reason,
+                is_shutdown,
+            )
+
+            action = "shutdown" if is_shutdown else "restart"
+            message = f"Worker {worker_identity.hostname} training {action} initiated (async)"
             return self._create_success_response(
-                manager_pb2.RestartResponse, acknowledged=success, message=message
+                manager_pb2.RestartResponse, acknowledged=True, message=message
             )
 
         except grpc.RpcError:
@@ -339,6 +380,76 @@ class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
                 context, grpc.StatusCode.INTERNAL, f"RestartTraining error: {e}"
             )
             raise
+
+    def ReportPodShutdown(
+        self, request: manager_pb2.PodShutdownRequest, context
+    ) -> manager_pb2.PodShutdownResponse:
+        """Handle pod shutdown reports (global managers only)."""
+        try:
+            self._validate_role("global_manager", "handle pod shutdown reports")
+
+            worker_identity = request.worker_identity
+
+            logging.warning(
+                "Pod shutdown reported: worker=%s (replica=%d, worker=%d), reason='%s'",
+                worker_identity.hostname,
+                worker_identity.replica_id,
+                worker_identity.worker_id,
+                request.reason,
+            )
+
+            # Trigger coordinated shutdown and restart
+            self._handle_pod_shutdown(worker_identity, request.reason)
+
+            return self._create_success_response(
+                manager_pb2.PodShutdownResponse,
+                message=f"Pod shutdown acknowledged for worker {worker_identity.hostname} "
+                f"(replica={worker_identity.replica_id}, worker={worker_identity.worker_id})",
+            )
+
+        except grpc.RpcError:
+            raise
+        except Exception as e:
+            self._create_error_response(
+                context, grpc.StatusCode.INTERNAL, f"ReportPodShutdown error: {e}"
+            )
+            raise
+
+    def _handle_pod_shutdown(self, affected_worker: WorkerIdentity, reason: str):
+        """Handle pod shutdown by terminating specific worker and restarting all replicas."""
+        logging.warning(
+            "Handling pod shutdown for worker %s (replica=%d, worker=%d): %s",
+            affected_worker.hostname,
+            affected_worker.replica_id,
+            affected_worker.worker_id,
+            reason,
+        )
+
+        with ManagerClient() as client:
+            # Step 1: Terminate the specific affected worker
+            shutdown_reason = f"IMMEDIATE_SHUTDOWN: Pod shutdown - {reason}"
+            logging.info("Terminating affected worker %s", affected_worker.hostname)
+
+            client.restart_worker(
+                affected_worker.hostname,
+                affected_worker.replica_id,
+                shutdown_reason,
+                affected_worker.worker_id,
+            )
+
+            # Step 2: Restart ALL replicas for JAX re-initialization
+            restart_reason = f"JAX re-init after pod shutdown: {affected_worker.hostname}"
+            logging.info("Restarting all replicas for JAX re-initialization")
+
+            try:
+                num_replicas = get_num_replicas()
+                for replica_id in range(num_replicas):
+                    replica_hostname = get_replica_head_hostname(replica_id)
+                    client.restart_replica(replica_hostname, replica_id, restart_reason)
+
+            except ValueError as e:
+                logging.error("Failed to restart replicas: %s", e)
+                raise
 
     def _forward_restart_to_workers(self, reason: str) -> Dict[str, bool]:
         """Forward restart request to all workers in this replica (replica manager only).
@@ -353,29 +464,42 @@ class ManagerServer(manager_pb2_grpc.ManagerServiceServicer):
             logging.error("Only replica managers can forward restart requests")
             return {}
 
-        results = {}
         worker_hostnames = get_all_worker_hostnames()
 
+        def restart_single_worker(hostname: str, client: ManagerClient) -> tuple:
+            """Send restart request to a single worker."""
+            try:
+                logging.info("Forwarding restart to worker: %s", hostname)
+                worker_id = extract_worker_id_from_hostname(hostname)
+
+                success = client.restart_worker(
+                    hostname, self._worker_identity.replica_id, reason, worker_id
+                )
+
+                if success:
+                    logging.info("Worker %s acknowledged restart request", hostname)
+                else:
+                    logging.warning("Worker %s failed to acknowledge restart request", hostname)
+
+                return (hostname, success)
+
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.error("Failed to forward restart to worker %s: %s", hostname, e)
+                return (hostname, False)
+
+        # Parallelize restart requests to all workers
+        # Use higher parallelism for restart - these are I/O-bound gRPC calls
+        results = {}
+        max_workers = min(len(worker_hostnames), MAX_RESTART_FORWARD_THREADS)
         with ManagerClient() as client:
-            for hostname in worker_hostnames:
-                try:
-                    logging.info("Forwarding restart to worker: %s", hostname)
-
-                    worker_id = get_worker_id()
-
-                    success = client.restart_worker(
-                        hostname, self._worker_identity.replica_id, reason, worker_id
-                    )
+            with futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_hostname = {
+                    executor.submit(restart_single_worker, hostname, client): hostname
+                    for hostname in worker_hostnames
+                }
+                for future in futures.as_completed(future_to_hostname):
+                    hostname, success = future.result()
                     results[hostname] = success
-
-                    if success:
-                        logging.info("Worker %s acknowledged restart request", hostname)
-                    else:
-                        logging.warning("Worker %s failed to acknowledge restart request", hostname)
-
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    logging.error("Failed to forward restart to worker %s: %s", hostname, e)
-                    results[hostname] = False
 
         return results
 

@@ -29,6 +29,7 @@ from axlearn.common.attention_bias import (
 from axlearn.common.flash_attention import tpu_attention
 from axlearn.common.flash_attention.common import ReferenceMHA
 from axlearn.common.flash_attention.layer import default_mha_dim_to_partition_spec
+from axlearn.common.flash_attention.splash_attention_mask import ComputableMask
 from axlearn.common.flash_attention.test_utils import generate_attention_data
 from axlearn.common.test_utils import TestCase, Tolerance, is_supported_mesh_shape
 from axlearn.common.utils import Tensor
@@ -54,6 +55,9 @@ def jax_fn_mask(sliding_window_size: int) -> Tensor:
 
     fun = and_masks(causal_mask, mask)
     return fun
+
+
+_singleton_mask_fn = jax_fn_mask(5)
 
 
 @skipIfGPU
@@ -107,13 +111,11 @@ class TestFlashAttention(TestCase):
         ],
         [
             MaskFnAttentionBias(
-                jax_fn_mask(5),
+                _singleton_mask_fn,
                 target_positions=jnp.arange(8)[None],
                 source_positions=jnp.arange(8)[None],
             ),
-            splash_attention_mask.NumpyMask(
-                array=np.array(jax_fn_mask(5)(jnp.arange(8)[:, None], jnp.arange(8)[None, :]))
-            ),
+            ComputableMask(shape=(8, 8), mask_fn=_singleton_mask_fn),
         ],
     )
     def test_to_splash_mask(self, mask, expected):
@@ -126,12 +128,87 @@ class TestFlashAttention(TestCase):
 
         inside_tracing(mask)
 
+    @parameterized.product(sliding_window_size=(None, 16), seq_len=(128, 2048))
+    def test_computable_mask(self, sliding_window_size, seq_len):
+        """Test that ComputableMask with mask_fn produces same results as equivalent splash mask."""
+        batch_size = 2
+        num_heads = 4
+        per_head_dim = 64
+        num_kv_heads = num_heads // 2
+
+        # Generate test data
+        q, k, v, _ = generate_attention_data(
+            batch_size,
+            seq_len,
+            seq_len,
+            num_heads,
+            per_head_dim,
+            num_kv_heads,
+            mask_fn=None,
+            dtype=jnp.bfloat16,
+        )
+
+        cfg = dict(
+            interpret=jax.default_backend() == "cpu",
+            softmax_scale=per_head_dim**-0.5,
+            tpu_block_size=128,
+        )
+        fn = tpu_attention.TPUSplashAttention.default_config().set(**cfg).instantiate()
+
+        # Test with ComputableMask.
+        if sliding_window_size is not None:
+            mask_fn = sliding_window_causal_mask(sliding_window_size=sliding_window_size)
+            bias_with_ref_mask = SlidingWindowAttentionBias(
+                mask=mask_fn,
+                sliding_window_size=sliding_window_size,
+                target_positions=jnp.arange(seq_len)[None],
+                source_positions=jnp.arange(seq_len)[None],
+            )
+        else:
+            mask_fn = causal_mask
+            bias_with_ref_mask = CausalAttentionBias(
+                target_positions=jnp.arange(seq_len)[None],
+                source_positions=jnp.arange(seq_len)[None],
+            )
+
+        prng_key = jax.random.PRNGKey(42)
+        # Outputs by splash mask
+        input_batch_ref = dict(
+            query=q,
+            key=k,
+            value=v,
+            bias=bias_with_ref_mask,
+            prng_key=prng_key,
+            logit_sink=None,
+        )
+        out_ref = fn(input_batch_ref)
+
+        # Outputs by computable mask
+        bias_with_computable_mask = MaskFnAttentionBias(
+            mask=mask_fn,
+            target_positions=jnp.arange(seq_len)[None],
+            source_positions=jnp.arange(seq_len)[None],
+        )
+        input_batch_computable = dict(
+            query=q,
+            key=k,
+            value=v,
+            bias=bias_with_computable_mask,
+            prng_key=prng_key,
+            logit_sink=None,
+        )
+        self.assertTrue(fn.is_supported(input_batch=input_batch_computable, kv_cache_type=None))
+        out_computable = fn(input_batch_computable)
+
+        # Both should produce the same output
+        self.assertNestedAllClose(out_computable, out_ref)
+
     @parameterized.product(
         batch_size=[2],
         kv_len=[128],
         num_heads=[4],
         mask=[None, causal_mask],
-        per_head_dim=[128],
+        per_head_dim=[64, 128, 150],
         q_dtype=[jnp.float32, jnp.bfloat16],
         kv_dtype=[jnp.float32, jnp.bfloat16],
     )
@@ -216,15 +293,15 @@ class TestFlashAttention(TestCase):
             self.skipTest("Backward path is broken on CPU")
         if mask not in (None, causal_mask) and query_length_multiplier > 1:
             self.skipTest("Sliding window attention does not make sense when q_len != kv_len.")
-        if dropout_rate > 0.0 and (attention_bias_type is not None or per_head_dim % 128 != 0):
+        if dropout_rate > 0.0 and attention_bias_type is not None:
             self.skipTest(
-                "Dropout is only supported with SplashAttention (which requires \
-                            no bias, and per_head_dim being a multiple of 128.)"
+                "Dropout is only supported with SplashAttention (which requires no bias.)"
             )
         if q_dtype == jnp.bfloat16 and kv_dtype == jnp.float32:
             self.skipTest("Q must have higher precision than KV.")
+
         # pylint: disable=protected-access
-        fallback_to_legacy = per_head_dim % 128 != 0 or (attention_bias_type is not None)
+        fallback_to_legacy = attention_bias_type is not None
         num_kv_heads = num_heads // head_group_size
         q, k, v, bias = generate_attention_data(
             batch_size,
