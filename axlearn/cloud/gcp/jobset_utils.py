@@ -32,10 +32,11 @@ from axlearn.cloud.gcp.node_pool import PRE_PROVISIONER_LABEL
 from axlearn.cloud.gcp.system_characteristics import (
     GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS,
     USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS,
+    get_host_bounds,
 )
 from axlearn.cloud.gcp.tpu import get_default_env, infer_tpu_cores, infer_tpu_workers
 from axlearn.cloud.gcp.utils import validate_jobset_name
-from axlearn.common.compiler_options import infer_tpu_type
+from axlearn.common.compiler_options import infer_tpu_type, infer_tpu_version
 from axlearn.common.config import REQUIRED, Required, config_class
 from axlearn.common.utils import Nested
 
@@ -368,6 +369,8 @@ class TPUJobBuilder(SingleReplicatedJob):
                 If None, we leave it to GCP to determine where the TPUs are located.
             enable_tpu_smart_repair: Whether to enable TPU smart repair.
                 GKE 1.29.3-gke.1154000 or above is required.
+            enable_tpu_slice_auto_provisioning: Whether to enable auto provisioning of TPU slices
+                based on the topology assignment.
             priority_class: Optional; The GKE PriorityClass for the job.
                 https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption
                 Note: 1. Values need to be pre-defined in each cluster.
@@ -379,6 +382,8 @@ class TPUJobBuilder(SingleReplicatedJob):
                 to attach to the node pool. This is needed to support multiple NIC.
                 Refer to GKE TPU provisioner for more context:
                 https://github.com/GoogleCloudPlatform/ai-on-gke/blob/5f256eed7075a5cb8e73cd72328aea46237b8ce6/tpu-provisioner/internal/cloud/common.go#L29-L31
+            job_labels: Optional dictionary of custom labels to be applied to the Job metadata.
+                These labels will be added in addition to the default job labels.
         """
 
         reservation: Optional[str] = None
@@ -386,8 +391,10 @@ class TPUJobBuilder(SingleReplicatedJob):
         enable_tpu_ici_resiliency: Optional[bool] = None
         location_hint: Optional[str] = None
         enable_tpu_smart_repair: bool = False
+        enable_tpu_slice_auto_provisioning: Optional[bool] = None
         priority_class: Optional[str] = None
         additional_node_networks: Optional[str] = None
+        job_labels: Optional[dict[str, str]] = None
 
     @classmethod
     def define_flags(cls, fv: flags.FlagValues):
@@ -488,6 +495,22 @@ class TPUJobBuilder(SingleReplicatedJob):
         env_vars = {**cfg.env_vars}
         if cfg.enable_tpu_ici_resiliency is not None:
             env_vars["ENABLE_ICI_RESILIENCY"] = str(cfg.enable_tpu_ici_resiliency).lower()
+
+        if cfg.enable_tpu_slice_auto_provisioning:
+            system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+            topology = cfg.accelerator.topology or system.topology
+            env_vars["TPU_TOPOLOGY"] = topology
+
+            tpu_version = infer_tpu_version(self._tpu_type)
+            bounds = get_host_bounds(topology, tpu_version)
+            if bounds:
+                chips_per_host_bounds, host_bounds = bounds
+                env_vars["TPU_CHIPS_PER_HOST_BOUNDS"] = ",".join(
+                    str(c) for c in chips_per_host_bounds
+                )
+                env_vars["TPU_HOST_BOUNDS"] = ",".join(str(h) for h in host_bounds)
+            else:
+                raise RuntimeError(f"Unsupported tpu type {self._tpu_type}")
 
         # This label will be used by TPU provisioner to select machine type.
         resources = {"limits": {"google.com/tpu": system.chips_per_vm}}
@@ -646,7 +669,7 @@ class TPUJobBuilder(SingleReplicatedJob):
                     volumeAttributes=dict(
                         bucketName=parsed.netloc,
                         # pylint: disable=line-too-long
-                        mountOptions=f"only-dir={parsed.path.lstrip('/')},implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,kernel-list-cache-ttl-secs=-1,gcs-connection:http-client-timeout:{cfg.gcsfuse_mount.http_client_timeout}",
+                        mountOptions=f"only-dir={parsed.path.lstrip("/")},implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,kernel-list-cache-ttl-secs=-1,gcs-connection:http-client-timeout:{cfg.gcsfuse_mount.http_client_timeout}",
                         gcsfuseMetadataPrefetchOnMount="false",  # Improves first-time read.
                         disableMetrics="false",  # Enables GCSFuse metrics by default.
                     ),
@@ -682,6 +705,9 @@ class TPUJobBuilder(SingleReplicatedJob):
         # Tier "0" corresponds to reserved; otherwise we use preemptible.
         tier = os.environ.get("BASTION_TIER", None)
 
+        # TODO(samos123) support using reservation when using local launch
+        # the local launch command automatically sets tier=disabled.
+        logging.info("Found tier=%s in env. Using reservation=%s", tier, cfg.reservation)
         if tier == "0" and cfg.reservation is not None:
             logging.info("Found tier=%s in env. Using reservation=%s", tier, cfg.reservation)
             selector.update({"cloud.google.com/reservation-name": cfg.reservation})
@@ -716,6 +742,9 @@ class TPUJobBuilder(SingleReplicatedJob):
         if cfg.enable_pre_provisioner:
             # Used by pre-provisioner.
             selector.update({PRE_PROVISIONER_LABEL: cfg.name})
+        elif cfg.enable_tpu_slice_auto_provisioning:
+            # Slice provisioning does not require additional selectors
+            pass
         elif tier != "disabled":
             # Used by GCP auto-provisioner.
             selector.update(
@@ -744,7 +773,8 @@ class TPUJobBuilder(SingleReplicatedJob):
             labels.update({"project-id": spec.metadata.project_id})
 
             # For job-priority to be populated to node labels when tpu-provisioner is used.
-            selector.update({"job-priority": str(spec.metadata.priority)})
+            if not cfg.enable_tpu_slice_auto_provisioning:
+                selector.update({"job-priority": str(spec.metadata.priority)})
 
         labels.update({"num-replicas": str(cfg.accelerator.num_replicas)})
 
@@ -769,11 +799,33 @@ class TPUJobBuilder(SingleReplicatedJob):
                 }
             )
 
+        if cfg.enable_tpu_slice_auto_provisioning:
+            annotations.update(
+                {
+                    "cloud.google.com/gke-tpu-topology": cfg.accelerator.topology
+                    or system.topology,
+                }
+            )
+            tolerations.append(
+                {
+                    "key": "google.com/tpu",
+                    "operator": "Equal",
+                    "value": "present",
+                    "effect": "NoSchedule",
+                }
+            )
+
         # Hardcode metadata.google.internal ip address to avoid transient DNS resolution issue.
         metadata_host_alias = dict(
             ip=_METADATA_GOOGLE_INTERNAL_IP,
             hostnames=["metadata", "metadata.google.internal"],
         )
+
+        node_selector_dict = {
+            "cloud.google.com/gke-tpu-accelerator": system.gke_accelerator,
+            "cloud.google.com/gke-tpu-topology": cfg.accelerator.topology or system.topology,
+            **selector,
+        }
 
         spec = dict(
             # NOTE: Don't set hostNetwork or dnsPolicy for compat with Workload Identity.
@@ -782,11 +834,7 @@ class TPUJobBuilder(SingleReplicatedJob):
             restartPolicy="Never",
             # https://kubernetes.io/docs/tasks/network/customize-hosts-file-for-pods/#adding-additional-entries-with-hostaliases
             hostAliases=[metadata_host_alias],
-            nodeSelector={
-                "cloud.google.com/gke-tpu-accelerator": system.gke_accelerator,
-                "cloud.google.com/gke-tpu-topology": cfg.accelerator.topology or system.topology,
-                **selector,
-            },
+            nodeSelector=node_selector_dict,
             tolerations=tolerations,
             containers=[self._build_container()],
             initContainers=[self._build_uploader_container()],
@@ -814,6 +862,27 @@ class TPUJobBuilder(SingleReplicatedJob):
             spec=spec,
         )
 
+    def _build_job_labels(self) -> dict[str, str]:
+        """Builds labels for the Job metadata.
+
+        Returns:
+            A dict of labels to be applied to the Job metadata, including both
+            default labels and custom labels from configuration.
+        """
+        cfg: TPUJobBuilder.Config = self.config
+        labels = {}
+        if cfg.job_labels:
+            labels.update(cfg.job_labels)
+
+        if cfg.enable_tpu_slice_auto_provisioning:
+            labels.update(
+                {
+                    "tpu-provisioner.cloud.google.com/inject-slice-selector": "true",
+                }
+            )
+
+        return labels
+
 
 class TPUReplicatedJob(TPUJobBuilder):
     """Builds a replicated job spec for a generic TPU job to be used with the JobSet API"""
@@ -825,7 +894,10 @@ class TPUReplicatedJob(TPUJobBuilder):
         cfg: TPUReplicatedJob.Config = self.config
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         job_spec = dict(
-            metadata=dict(annotations=self._load_balancer.metadata),
+            metadata=dict(
+                annotations=self._load_balancer.metadata,
+                labels=self._build_job_labels(),
+            ),
             spec=dict(
                 parallelism=system.vms_per_slice,
                 completions=system.vms_per_slice,

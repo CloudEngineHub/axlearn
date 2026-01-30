@@ -17,6 +17,7 @@ import dataclasses
 import functools
 import os
 from concurrent import futures
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import jax
@@ -24,9 +25,11 @@ import numpy as np
 import orbax.checkpoint as ocp
 import tensorflow as tf
 from absl import logging
+from etils import epath
 from orbax.checkpoint._src.metadata import array_metadata_store as array_metadata_store_lib
 from orbax.checkpoint._src.serialization.type_handlers import ArrayHandler
-from orbax.checkpoint.checkpoint_manager import _ShouldSaveFnPolicy
+from orbax.checkpoint.checkpoint_manager import CheckpointInfo, _ShouldSaveFnPolicy
+from tensorflow.python.checkpoint import async_checkpoint_helper
 
 from axlearn.common import utils
 from axlearn.common.checkpointer import (
@@ -91,6 +94,20 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
             self._tf_ckpt_cache[value] = tf.train.Checkpoint(value)
         return self._tf_ckpt_cache[value]
 
+    def _sync_tf_ckpt_and_check_error(self, ckpt: tf.train.Checkpoint):
+        # When `enable_async=True`, `ckpt.sync` will always return silently even
+        # if it failed to save the checkpoint correctly. What makes it worse is
+        # that Orbax Checkpoint Manager relies on the successful execution to
+        # write the `commit_success.txt` file. Here we check and rethrow the
+        # error if there's any.
+        ckpt.sync()
+        # pylint: disable=protected-access
+        # pytype: disable=attribute-error
+        assert isinstance(ckpt._async_checkpointer(), async_checkpoint_helper.AsyncCheckpointHelper)
+        ckpt._async_checkpointer()._check_async_thread_error()
+        # pytype: enable=attribute-error
+        # pylint: enable=protected-access
+
     async def serialize(
         self,
         values: Sequence[tf.data.Iterator],
@@ -103,7 +120,11 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
         for value, info in zip(values, infos, strict=False):
             tf_ckpt = self._get_or_create_tf_ckpt(value)
             tf_ckpt.write(self._ckpt_dir(info), tf.train.CheckpointOptions(enable_async=True))
-            futs.append(self._executor.submit(tf_ckpt.sync))
+            futs.append(
+                self._executor.submit(
+                    functools.partial(self._sync_tf_ckpt_and_check_error, tf_ckpt)
+                )
+            )
         return futs
 
     async def deserialize(
@@ -122,7 +143,9 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
 
         await asyncio.gather(
             *(
-                asyncio.get_event_loop().run_in_executor(self._executor, ckpt.sync)
+                asyncio.get_event_loop().run_in_executor(
+                    self._executor, functools.partial(self._sync_tf_ckpt_and_check_error, ckpt)
+                )
                 for ckpt in tf_ckpts
             )
         )
@@ -227,6 +250,82 @@ if _GRAIN_INSTALLED:
     )
 
 
+class _CheckpointManagerWithTrackerFile(ocp.CheckpointManager):
+    # pylint: disable=line-too-long
+    """
+    In some extreme cases, the number of available checkpoints may be quite
+    large and the time spent on listing checkpoints can take > 10 minutes. This
+    implementation extends the original CheckpointManager from Orbax to support
+    reading only the latest checkpoint from a tracker file. So the time spent on
+    initialization is constant and small. Inspired by
+    [Megatron-LM](https://github.com/NVIDIA/Megatron-LM/blob/98d8c56dbdc9cc91b8a473debcf400958bba4524/megatron/training/checkpointing.py#L259).
+
+    TODO(jtian22): Avoid overriding private methods or up merge it as a configurable option.
+    """
+
+    # pylint: enable=line-too-long
+
+    def __init__(self, *args, tracker_filename="latest_checkpointed_step.txt", **kwargs):
+        self._tracker_filename = tracker_filename
+        super().__init__(*args, **kwargs)
+
+    @property
+    def tracker_file_path(self) -> epath.Path:
+        return self.directory / self._tracker_filename
+
+    def _load_checkpoint_infos(self, skip_metadata_read=False) -> List[CheckpointInfo]:
+        """The original version looks up in the root directory and return all
+        the successfully committed steps. Here we only return the latest one
+        recorded in the track file. If that one is invalid or any exception is
+        caught, we fallback to the original implementation.
+
+        The checkpoint garbage collection thread will still work during current
+        restart attempt, however steps prior to the one read from the tracker
+        file at the start of current restart attempt will be skipped.
+
+        TODO(jtian22): Improve GC of unnecessary checkpoints.
+        """
+        try:
+            latest_step = int(self.tracker_file_path.read_text())
+            latest_step_directory = self._get_write_step_directory(latest_step, self.directory)
+
+            if ocp.step.is_path_finalized(latest_step_directory):
+                mtime = self.tracker_file_path.stat().mtime
+                latest_ckpt_info = CheckpointInfo(latest_step, datetime.fromtimestamp(mtime), None)
+                return [latest_ckpt_info]
+            else:
+                raise ValueError(
+                    (
+                        f"The checkpoint {latest_step_directory} is corrupted!"
+                        "The commit success file is missing!"
+                    )
+                )
+        # pylint: disable-next=broad-exception-caught
+        except Exception as e:
+            logging.warning(
+                (
+                    "Failed to read latest checkpoint from tracker file %s!"
+                    "Fallback to reading subfolders under %s"
+                    "Error message: %s"
+                ),
+                self.tracker_file_path,
+                self.directory,
+                e,
+            )
+            return super()._load_checkpoint_infos(skip_metadata_read)
+
+    def _finalize_checkpoint(self, step: int):
+        super()._finalize_checkpoint(step)
+        # In the worst (and rare) case, the checkpoint at `step` was just
+        # successfully saved but the job then restarted and the tracker file was
+        # not updated. Then we lost the progress up to the second latest
+        # checkpoint.
+        save_directory = self._get_write_step_directory(step, self.directory)
+        if ocp.utils.is_primary_host(self._multiprocessing_options.primary_host):
+            if ocp.step.is_path_finalized(save_directory):
+                self.tracker_file_path.write_text(str(step))
+
+
 class OrbaxCheckpointer(BaseCheckpointer):
     """A checkpointer that uses orbax CheckpointManager.
 
@@ -267,6 +366,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
         # controls whether to skip that saving or not. The benefit of skipping
         # is to save the time on deleting an incomplete checkpoint folder.
         skip_uncommitted_checkpoint: bool = True
+        # Read only the latest checkpoint recorded in the tracker file if set to `True`
+        read_latest_checkpoint_from_tracker_file: bool = False
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -330,7 +431,12 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
             return is_save
 
-        self._manager = ocp.CheckpointManager(
+        CheckpointManager = (
+            _CheckpointManagerWithTrackerFile
+            if cfg.read_latest_checkpoint_from_tracker_file
+            else ocp.CheckpointManager
+        )
+        self._manager = CheckpointManager(
             directory=cfg.dir,
             options=ocp.CheckpointManagerOptions(
                 create=True,

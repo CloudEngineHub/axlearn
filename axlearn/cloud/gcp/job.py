@@ -6,7 +6,9 @@ See also ``On configuration`` in `axlearn/cloud/gcp/job.py`.
 """
 
 import enum
+import json
 import logging
+import os
 import shlex
 import subprocess
 from collections.abc import Sequence
@@ -15,6 +17,7 @@ from typing import Any, Optional
 import kubernetes as k8s
 from absl import flags
 
+from axlearn.cloud.common.bastion import BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR
 from axlearn.cloud.common.bundler import BaseDockerBundler
 from axlearn.cloud.common.job import Job
 from axlearn.cloud.common.utils import generate_job_name, subprocess_run
@@ -111,6 +114,7 @@ class GKEJob(GCPJob):
         queue: Optional[str] = None
         annotations: Optional[ConfigOr[dict]] = None
         labels: Optional[ConfigOr[dict]] = None
+        enable_tpu_slice_auto_provisioning: Optional[bool] = None
 
     @classmethod
     def define_flags(cls, fv: flags.FlagValues):
@@ -121,6 +125,12 @@ class GKEJob(GCPJob):
             "queue",
             None,
             "The name of the Kueue LocalQueue to use. If not set, no queue is used.",
+            **common_kwargs,
+        )
+        flags.DEFINE_boolean(
+            "enable_tpu_slice_auto_provisioning",
+            None,
+            "Auto provision TPU slices based on the topology assignment.",
             **common_kwargs,
         )
 
@@ -138,13 +148,93 @@ class GKEJob(GCPJob):
         # together under the jobset represented by this class.
         # Note the distinction from bundlers, which are responsible for bundling any code assets
         # required to run the job.
-        self._builder: BaseReplicatedJob = cfg.builder.instantiate(bundler=bundler)
+
+        # Pass enable_tpu_slice_auto_provisioning from GKEJob to the builder
+        builder_cfg = cfg.builder
+        if (
+            hasattr(builder_cfg, "enable_tpu_slice_auto_provisioning")
+            and cfg.enable_tpu_slice_auto_provisioning is not None
+        ):
+            builder_cfg.enable_tpu_slice_auto_provisioning = cfg.enable_tpu_slice_auto_provisioning
+
+        self._builder: BaseReplicatedJob = builder_cfg.instantiate(bundler=bundler)
 
     def _delete(self):
         cfg: GKEJob.Config = self.config
         # Issues a delete request for the JobSet and proactively delete its descendants. This is not
         # fully blocking; after the call returns there can be a delay before everything is deleted.
         delete_k8s_jobset(cfg.name, namespace=cfg.namespace)
+
+    def _get_topology_assignment(self) -> Optional[list[list[str]]]:
+        """Retrieves TPU topology assignments from the environment variable.
+
+        When TPU slice auto-provisioning is enabled, Bastion passes topology assignments
+        through an environment variable. These assignments specify which TPU slices should be
+        used for the job, enabling precise control over TPU resource allocation.
+
+        Example topology assignment:
+            [["sub-block-id", "sub-block-id"]]
+
+        This is the assignment for a job asking for tpu-7x-256, that needs 128 chips, using
+        2 sub-blocks (64 chips per sub-block). This job will run on a TPU slice formed by
+        2 sub-blocks. Each inner array represents the TPU slice info for a job's replica.
+
+        Returns:
+            A list of lists of strings representing topology assignments, where each inner list
+            contains slice identifiers for a particular job replica. Returns None if the
+            environment variable is not set or if parsing fails.
+        """
+        topology_assignments_env = os.environ.get(BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR)
+        if not topology_assignments_env:
+            logging.info("No %s environment variable set.", BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR)
+            return None
+
+        try:
+            return json.loads(topology_assignments_env)
+        except json.JSONDecodeError as e:
+            logging.warning(
+                "Failed to parse topology assignments from env var %s, value: %s, error: %s",
+                BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR,
+                topology_assignments_env,
+                e,
+            )
+            return None
+
+    def _get_tpu_job_name_from_replicated_jobs(
+        self, replicated_jobs: Sequence[Nested[Any]]
+    ) -> Optional[str]:
+        """Extracts the name of the replicated job that has TPU node selectors.
+
+        Iterates through the replicated jobs and finds the one that contains
+        cloud.google.com/gke-tpu-accelerator and cloud.google.com/gke-tpu-topology
+        node selectors, which indicate it's a TPU job. Returns that jobs name.
+
+        Args:
+            replicated_jobs: List of replicated job specs from the JobSet.
+
+        Returns:
+            The name of the replicated job that contains TPU node selectors,
+            or None if no such job is found.
+        """
+        for job in replicated_jobs:
+            # Navigate to the node selector in the job spec
+            # Structure: job -> template -> spec -> template -> spec -> nodeSelector
+            node_selector = (
+                job.get("template", {})
+                .get("spec", {})
+                .get("template", {})
+                .get("spec", {})
+                .get("nodeSelector", {})
+            )
+
+            # Check if TPU node selectors are present
+            has_tpu_accelerator = "cloud.google.com/gke-tpu-accelerator" in node_selector
+            has_tpu_topology = "cloud.google.com/gke-tpu-topology" in node_selector
+
+            if has_tpu_accelerator and has_tpu_topology:
+                return str(job.get("name"))
+
+        return None
 
     def _build_jobset(self) -> Nested[Any]:
         """Builds a config for a JobSet, which is a set of Jobs.
@@ -159,11 +249,37 @@ class GKEJob(GCPJob):
         labels = maybe_instantiate(cfg.labels or {})
         if cfg.queue:
             annotations["kueue.x-k8s.io/queue-name"] = cfg.queue
+
+        replicated_jobs = self._builder()
+
+        # Bastion passes the job metadata to the runner through env vars
+        # If the job has topology assigned, its also in the env var
+        # Try to parse the env var and get the topology assignments.
+        topology_assignment = self._get_topology_assignment()
+        if cfg.enable_tpu_slice_auto_provisioning and topology_assignment:
+            # Get the TPU job name from the replicated jobs
+            tpu_job_name = self._get_tpu_job_name_from_replicated_jobs(replicated_jobs)
+            if tpu_job_name is None:
+                logging.warning(
+                    "TPU slice auto-provisioning enabled but no TPU job found in replicated jobs"
+                )
+                tpu_job_name = self._builder.config.job_name  # Fallback to builder job name
+            slice_selection = json.dumps({tpu_job_name: topology_assignment})
+            logging.info("Adding slice selection: %s to job set", slice_selection)
+            labels.update({"tpu-provisioner.cloud.google.com/slice-autoprovisioning": "sync"})
+            annotations.update(
+                {"tpu-provisioner.cloud.google.com/slice-selection": slice_selection}
+            )
+
+            # Finally, make sure to remove the exclusive topology annotation, that is not required
+            # When using slice auto provisioning
+            annotations.pop("alpha.jobset.sigs.k8s.io/exclusive-topology", None)
+
         return dict(
             metadata=dict(name=cfg.name, annotations=annotations, labels=labels),
             spec=dict(
                 failurePolicy=dict(maxRestarts=cfg.max_tries - 1),
-                replicatedJobs=self._builder(),
+                replicatedJobs=replicated_jobs,
             ),
         )
 
@@ -172,7 +288,7 @@ class GKEJob(GCPJob):
         cfg: GKEJob.Config = self.config
         api_kwargs = custom_jobset_kwargs()
         custom_object = dict(
-            apiVersion=f"{api_kwargs['group']}/{api_kwargs['version']}",
+            apiVersion=f"{api_kwargs["group"]}/{api_kwargs["version"]}",
             kind="JobSet",
             **self._build_jobset(),
         )
@@ -435,7 +551,7 @@ class GKELeaderWorkerSet(GCPJob):
 
         api_kwargs = custom_leaderworkerset_kwargs()
         custom_object = dict(
-            apiVersion=f"{api_kwargs['group']}/{api_kwargs['version']}",
+            apiVersion=f"{api_kwargs["group"]}/{api_kwargs["version"]}",
             kind="LeaderWorkerSet",
             **self._build_leaderworkerset(),
         )

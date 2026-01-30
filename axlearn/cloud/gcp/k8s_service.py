@@ -66,7 +66,7 @@ class LWSService(Service):
             port_names: Names of ports in a service
         """
 
-        namespace: str = None
+        namespace: str = "default"
         protocol_list: Optional[list[str]] = None
         ports: Optional[list[str]] = None
         target_ports: Optional[list[str]] = None
@@ -148,11 +148,12 @@ class LWSService(Service):
         Returns:
             A nested dict corresponding to a k8s Service config
         """
+        cfg = self.config
         logging.info("LWSservice class build")
         logging.info(str(self.config))
         api_kwargs = custom_leaderworkerset_kwargs()
 
-        namespace = "default"
+        namespace = cfg.namespace
         group = api_kwargs["group"]
         version = api_kwargs["version"]
         plural = api_kwargs["plural"]
@@ -181,7 +182,7 @@ class LWSService(Service):
                 name=self.name,
                 owner_references=[
                     k8s.client.V1OwnerReference(
-                        api_version=f"{api_kwargs['group']}/{api_kwargs['version']}",
+                        api_version=f"{api_kwargs["group"]}/{api_kwargs["version"]}",
                         kind="LeaderWorkerSet",
                         name=lws_name,  ### self.name is a name+"-service"
                         uid=lws["metadata"]["uid"],

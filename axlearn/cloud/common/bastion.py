@@ -136,6 +136,7 @@ _LOG_DIR = "/var/tmp/logs"  # Use /var/tmp/ since /tmp/ is cleared every 10 days
 _JOB_DIR = "/var/tmp/jobs"
 _BASTION_SERIALIZED_JOBSPEC_ENV_VAR = "_BASTION_SERIALIZED_JOBSPEC"
 BASTION_JOB_VERSION_ENV_VAR = "BASTION_JOB_VERSION"
+BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR = "BASTION_JOB_TOPOLOGY_ASSIGNMENT"
 
 FLAGS = flags.FLAGS
 
@@ -373,7 +374,7 @@ def deserialize_jobspec(f: Union[str, IO]) -> JobSpec:
             env_vars=data.get("env_vars", None),
             metadata=JobMetadata(**data["metadata"]),
         )
-    raise ValidationError(f"Unsupported version: {data['version']}")
+    raise ValidationError(f"Unsupported version: {data["version"]}")
 
 
 # TODO(clopeznataren): Refactor into JobValidator
@@ -1077,6 +1078,14 @@ class Bastion(Configurable):
                 # For backwards compatibility, only set the version in env when not None.
                 env_vars.update({BASTION_JOB_VERSION_ENV_VAR: job.spec.metadata.version})
 
+            # Serialize the topology assignments to env var
+            # this will be deserialized by the job runners to retrieve the topology assignment info
+            topology_assignment = job.state.metadata.get("topology_assignment")
+            if topology_assignment:
+                env_vars.update(
+                    {BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR: json.dumps(topology_assignment)}
+                )
+
             serialized_jobspec = io.StringIO()
             serialize_jobspec(job.spec, serialized_jobspec)
             env_vars |= {_BASTION_SERIALIZED_JOBSPEC_ENV_VAR: serialized_jobspec.getvalue()}
@@ -1225,6 +1234,10 @@ class Bastion(Configurable):
                 new_tier = verdict.metadata.get("tier")
                 changed_tiers = old_tier != new_tier
 
+                old_topology = job.state.metadata.get("topology_assignment")
+                new_topology = verdict.metadata.get("topology_assignment")
+                changed_topology = old_topology != new_topology
+
                 jobspec_changed = job.state.metadata.get("updated")
 
                 # Jobspec changed, trigger a restart of the runner.
@@ -1236,7 +1249,9 @@ class Bastion(Configurable):
                         state=JobLifecycleState.UPDATING,
                     )
                     job.state.status = JobStatus.PENDING
-                elif job.state.status == JobStatus.PENDING or not changed_tiers:
+                elif job.state.status == JobStatus.PENDING or (
+                    not changed_tiers and not changed_topology
+                ):
                     # Resume if not running, or keep running if scheduling tier did not change.
                     job.state.status = JobStatus.ACTIVE
                 else:
@@ -1246,12 +1261,20 @@ class Bastion(Configurable):
                     # low priority to high priority if it was demoted recently.
                     # TODO(markblee): Add instrumentation to track frequency of tier changes to
                     # see whether this is necessary.
-                    assert job.state.status == JobStatus.ACTIVE and changed_tiers
+                    assert job.state.status == JobStatus.ACTIVE and (
+                        changed_tiers or changed_topology
+                    )
+                    reason = []
+                    if changed_tiers:
+                        reason.append(f"tier from {old_tier} to {new_tier}")
+                    if changed_topology:
+                        reason.append(f"topology from {old_topology} to {new_topology}")
                     self._append_to_job_history(
                         job,
-                        msg=f"Rescheduling at a different tier from {old_tier} to {new_tier}",
+                        msg=f"Rescheduling due to changed {" and ".join(reason)}",
                         state=JobLifecycleState.RESCHEDULING,
                     )
+                    logging.info("Rescheduling %s due to %s", job.spec.name, reason)
                     job.state.status = JobStatus.PENDING
             else:
                 # Pre-empt/stay queued.
@@ -1263,6 +1286,7 @@ class Bastion(Configurable):
                     job.state.status = JobStatus.PENDING
                     # Pending jobs which are not rescheduled should have no tier information.
                     verdict.metadata.pop("tier", None)
+                    verdict.metadata.pop("topology_assignment", None)
 
             job.state.metadata = verdict.metadata
 

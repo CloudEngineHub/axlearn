@@ -62,6 +62,7 @@ Example:
 """
 
 import enum
+import json
 import os
 import time
 from typing import Optional, cast
@@ -114,6 +115,48 @@ def _infer_reservation(jobset_spec: dict) -> Optional[str]:
     except (TypeError, KeyError):
         logging.warning("Failed to infer reservation.")
     return None
+
+
+def _topology_assignment_from_jobset(jobset: dict) -> Optional[list[list[str]]]:
+    """Infers reservation given a jobset spec."""
+    topology_assignments_str = (
+        jobset.get("metadata", {})
+        .get("annotations", {})
+        .get("tpu-provisioner.cloud.google.com/slice-selection")
+    )
+    if not topology_assignments_str:
+        return None
+
+    try:
+        topology_dict = json.loads(topology_assignments_str)
+        # Get the first entry in the dict (regardless of the key name), since currently
+        # we only support a single tpu container per jobset.
+        return next(iter(topology_dict.values())) if topology_dict else None
+    except json.JSONDecodeError as e:
+        logging.warning(
+            "Failed to parse topology assignments from annotations %s. error: %s",
+            topology_assignments_str,
+            e,
+        )
+        return None
+
+
+def _topology_assignment_from_env() -> Optional[list[list[str]]]:
+    topology_assignments_env = os.environ.get("BASTION_JOB_TOPOLOGY_ASSIGNMENT")
+    if not topology_assignments_env:
+        logging.debug("No %s environment variable set.", "BASTION_JOB_TOPOLOGY_ASSIGNMENT")
+        return None
+
+    try:
+        return json.loads(topology_assignments_env)
+    except json.JSONDecodeError as e:
+        logging.warning(
+            "Failed to parse topology assignments from env var "
+            "BASTION_JOB_TOPOLOGY_ASSIGNMENT %s. error: %s",
+            topology_assignments_env,
+            e,
+        )
+        return None
 
 
 def _infer_processor_type(jobset_spec: dict) -> Optional[str]:
@@ -236,7 +279,7 @@ class GKERunnerJob(BaseRunnerJob):
         fv.set_default("name", fv.name or generate_job_name())
         fv.set_default("namespace", "default")
         fv.set_default(
-            "output_dir", f"gs://{gcp_settings('ttl_bucket', fv=fv)}/axlearn/jobs/{fv.name}"
+            "output_dir", f"gs://{gcp_settings("ttl_bucket", fv=fv)}/axlearn/jobs/{fv.name}"
         )
 
     @classmethod
@@ -322,6 +365,11 @@ class GKERunnerJob(BaseRunnerJob):
             reservation = _infer_reservation(resp["spec"])
             processor_type = _infer_processor_type(resp["spec"])
             if runner_utils.should_recreate_job(tier, reservation, processor_type=processor_type):
+                return GKERunnerJob.Status.RESCHEDULED
+
+            topology_assignment_env = _topology_assignment_from_env()
+            topology_assignment_jobset = _topology_assignment_from_jobset(jobset=resp)
+            if topology_assignment_env != topology_assignment_jobset:
                 return GKERunnerJob.Status.RESCHEDULED
 
             expected_job_version = os.environ.get(BASTION_JOB_VERSION_ENV_VAR, None)
@@ -741,7 +789,7 @@ class LWSRunnerJob(BaseRunnerJob):
         fv.set_default("name", fv.name or generate_job_name())
         fv.set_default("namespace", "default")
         fv.set_default(
-            "output_dir", f"gs://{gcp_settings('ttl_bucket', fv=fv)}/axlearn/jobs/{fv.name}"
+            "output_dir", f"gs://{gcp_settings("ttl_bucket", fv=fv)}/axlearn/jobs/{fv.name}"
         )
 
     @classmethod
