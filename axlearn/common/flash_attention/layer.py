@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from absl import logging
-from jax.experimental.shard_map import shard_map
 from jax.interpreters.pxla import thread_resources
 from jax.sharding import PartitionSpec
 
@@ -17,9 +16,15 @@ from axlearn.common.attention import Dropout, ForwardMode, GroupedQueryAttention
 from axlearn.common.attention_bias import BaseAttentionBias
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.config import ConfigBase, ConfigModifier, config_class
+from axlearn.common.flash_attention.common import split_prng_keys_for_shard_map
 from axlearn.common.flash_attention.utils import flash_attention_implementation
 from axlearn.common.module import Module
-from axlearn.common.utils import Tensor, maybe_shard, with_sharding_constraint
+from axlearn.common.utils import (
+    Tensor,
+    get_current_abstract_or_physical_mesh,
+    maybe_shard,
+    with_sharding_constraint,
+)
 
 
 class FlashAttention(GroupedQueryAttention):
@@ -262,24 +267,34 @@ class FlashAttention(GroupedQueryAttention):
             attention_logit_biases, attention_logit_biases_spec
         )
 
+        query_partition_spec = cfg.mha_dim_to_partition_spec["btnh"]
         # When using paged attention, k/v_proj have different format.
         kv_partition = "bsnh" if page_indices is None else "nbph"
 
         # Constrain input to conform to partitioned MHA expectations.
-        q_proj = with_sharding_constraint(q_proj, cfg.mha_dim_to_partition_spec["btnh"])
+        q_proj = with_sharding_constraint(q_proj, query_partition_spec)
         k_proj = with_sharding_constraint(k_proj, cfg.mha_dim_to_partition_spec[kv_partition])
         v_proj = with_sharding_constraint(v_proj, cfg.mha_dim_to_partition_spec[kv_partition])
+
+        # For PRNG key, extract all sharded axes to ensure unique dropout across all devices.
+        # Flatten nested tuples into a single tuple for 1D PartitionSpec, so each device gets (4,).
+        sharded_axes = tuple(axis for axis in query_partition_spec if axis is not None)
+        sharded_axes = jax.tree.flatten(sharded_axes)[0]
+        prng_key_partition_spec = PartitionSpec(sharded_axes) if sharded_axes else PartitionSpec()
+        # Pre-split PRNG key to ensure unique randomness across sharded devices
+        prepared_prng_key = split_prng_keys_for_shard_map(
+            self.dropout.get_prng_key(), prng_key_partition_spec, thread_resources.env.physical_mesh
+        )
 
         # We need to manually partition pallas | jax-triton calls.
         input_batch_specs = {
             # Q [batch_size, seq_len, num_heads, per_head_dim].
-            "query": cfg.mha_dim_to_partition_spec["btnh"],
+            "query": query_partition_spec,
             # KV [batch_size, seq_len, repeated_num_heads, per_head_dim].
             # repeated_num_heads should be divided evenly by the n axis.
             "key": cfg.mha_dim_to_partition_spec[kv_partition],
             "value": cfg.mha_dim_to_partition_spec[kv_partition],
-            # PRNG Key
-            "prng_key": PartitionSpec(None),
+            "prng_key": prng_key_partition_spec,
             # Bias that can broadcast to [batch_size, num_heads, seq_len, seq_len].
             "bias": attention_logit_biases_spec,
             # Logit sink values of shape [num_heads].
@@ -292,15 +307,15 @@ class FlashAttention(GroupedQueryAttention):
             "page_tables": cfg.mha_dim_to_partition_spec.get("bs", PartitionSpec(None)),
             **flash_specs.additional_in_specs,
         }
-        partitioned_mha = shard_map(
+        partitioned_mha = jax.shard_map(
             flash_specs.fn,
-            mesh=thread_resources.env.physical_mesh,
+            mesh=get_current_abstract_or_physical_mesh(),
             in_specs=(input_batch_specs,),
             # O [batch_size, seq_len, num_heads, per_head_dim].
-            out_specs=cfg.mha_dim_to_partition_spec["btnh"],
+            out_specs=query_partition_spec,
             # Disables a checking pass which jax can't apply when there's a triton | pallas
             # call in the body.
-            check_rep=False,
+            check_vma=False,
         )
 
         # Note: we use dropout layer's prng_key so the dropout result is identical to
@@ -309,17 +324,14 @@ class FlashAttention(GroupedQueryAttention):
             "query": q_proj,
             "key": k_proj,
             "value": v_proj,
-            "prng_key": self.dropout.get_prng_key(),
+            "prng_key": prepared_prng_key,
             "bias": attention_logit_biases,
             "logit_sink": logit_sink,
             "page_tables": page_indices,
             **flash_specs.additional_kwargs,
         }
         outputs = with_sharding_constraint(
-            partitioned_mha(
-                input_batch,
-            ),
-            cfg.output_dim_to_partition_spec["btnh"],
+            partitioned_mha(input_batch), cfg.output_dim_to_partition_spec["btnh"]
         )
 
         # TODO(markblee): Add output probs and benchmark.

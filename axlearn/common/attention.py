@@ -1023,6 +1023,8 @@ class FusedGroupedQKVLinear(BaseQKVLinear):
         num_kv_heads: Required[int] = REQUIRED
         # The layer used to project.
         layer: MultiheadInputLinear.Config = MultiheadInputLinear.default_config()
+        # Optional partition spec for query, key, value output activations.
+        output_partition_spec: Optional[PartitionSpec] = None
 
     def __init__(self, cfg: Config, *, parent: Module):
         super().__init__(cfg, parent=parent)
@@ -1073,17 +1075,18 @@ class FusedGroupedQKVLinear(BaseQKVLinear):
         q_proj, k_proj, v_proj = jnp.split(
             proj, [cfg.num_heads, cfg.num_heads + cfg.num_kv_heads], axis=-2
         )
-        # This sharding hint is needed since compiler sometimes will generate large allgather
-        # before the split and then slice, which is not the ideal compilation. Ensure sharding
-        # after the split to ensure allgather is inserted after the split.
-        axis_names = thread_resources.env.physical_mesh.axis_names
-        batch_axes = tuple(x for x in axis_names if x in ("data", "fsdp")) or None
-        spec = PartitionSpec(
-            batch_axes,
-            "seq" if "seq" in axis_names else None,
-            "model" if "model" in axis_names else None,
-            None,
-        )
+        if (spec := cfg.output_partition_spec) is None:
+            # This sharding hint is needed since compiler sometimes will generate large allgather
+            # before the split and then slice, which is not the ideal compilation. Ensure sharding
+            # after the split to ensure allgather is inserted after the split.
+            axis_names = thread_resources.env.physical_mesh.axis_names
+            batch_axes = tuple(x for x in axis_names if x in ("data", "fsdp")) or None
+            spec = PartitionSpec(
+                batch_axes,
+                "seq" if "seq" in axis_names else None,
+                "model" if "model" in axis_names else None,
+                None,
+            )
         q_proj = with_sharding_constraint(q_proj, spec)
         k_proj = with_sharding_constraint(k_proj, spec)
         v_proj = with_sharding_constraint(v_proj, spec)
@@ -4627,13 +4630,16 @@ class RematRegexSavePatterns(enum.Enum):
     O_PROJ = r".*o_proj"
     CONTEXT = r".*context"
     LINEAR1_X = r".*linear1_[01]"
-    LINEAR2_X = r".*linear2_[01]"
+    LINEAR2_X = r".*linear2(_[01])?"
+    GATE_WEIGHTS = r".*gate_weights"
+    GATE_ASSIGNMENT = r".*gate_assignment"
     # This is called native attention because the "context" remat point only exists when using
     # native attention, e.g. `MultiheadAttention` or `GroupedQueryAttention`.
     NATIVE_ATTENTION = ".*([qkvo]_proj|context)"
     FLASH_CONTEXT = f".*{FLASH_ATTN_RESIDUAL_NAME}"
     FLASH_ATTENTION = "|".join([FLASH_CONTEXT, QKV_PROJ, O_PROJ])
     FEED_FORWARD = "|".join([LINEAR1_X, LINEAR2_X])
+    MOE_GATING = "|".join([GATE_WEIGHTS, GATE_ASSIGNMENT])
     INPUT = r".*input"
 
 

@@ -870,6 +870,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             inner: The wrapped TPUReplicatedJob configuration.
             pathways_head_cpu: CPU request for pathways-head container.
             pathways_head_mem: Memory request for pathways-head container.
+            startup_probe_failure_threshold: Max failures before startup probe fails.
+            health_check_path: Path for health check endpoint (e.g., /v1/health).
+            health_check_port: Port for health check endpoint.
             colocated_python: Configuration for Colocated Python.
         """
 
@@ -880,6 +883,15 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
 
         target_port: Optional[int] = None
         enable_service: bool = None
+
+        # Health probe configuration for inference pods.
+        # - startup_probe_failure_threshold: Max consecutive failures before probe fails.
+        #   Max startup time = threshold * 10 seconds (probe period). Default 360 = 1 hour.
+        # - health_check_path: HTTP path for health endpoint (default: /v1/health).
+        # - health_check_port: Port for health endpoint (default: 8080).
+        startup_probe_failure_threshold: Optional[int] = None
+        health_check_path: Optional[str] = None
+        health_check_port: Optional[int] = None
 
         colocated_python: Required[PathwaysColocatedPythonPlugin.Config] = REQUIRED
 
@@ -920,6 +932,26 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             "target_port",
             None,
             "port where a service can access application, set at head container",
+            **common_kwargs,
+        )
+        flags.DEFINE_integer(
+            "startup_probe_failure_threshold",
+            360,
+            "Number of consecutive failures before the startup probe considers the container "
+            "failed. Max startup time = threshold * 10 seconds. Default 360 allows 1 hour. "
+            "Increase for larger models that need more loading time.",
+            **common_kwargs,
+        )
+        flags.DEFINE_string(
+            "health_check_path",
+            "/v1/health",
+            "Path for health check endpoint used by startup and readiness probes.",
+            **common_kwargs,
+        )
+        flags.DEFINE_integer(
+            "health_check_port",
+            8080,
+            "Port for health check endpoint used by startup and readiness probes.",
             **common_kwargs,
         )
 
@@ -1054,17 +1086,18 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         )
 
     def _build_head_container(self) -> dict:
-        cfg: TPULeaderWorkerTemplate.Config = self._inner.config
-        cpu_req = f"{float(self.config.pathways_head_cpu) * 1000}m"
-        mem_req = f"{self.config.pathways_head_mem}Gi"
+        cfg: PathwaysLeaderWorkerTemplate.Config = self.config
+        inner_cfg: TPULeaderWorkerTemplate.Config = self._inner.config
+        cpu_req = f"{float(cfg.pathways_head_cpu) * 1000}m"
+        mem_req = f"{cfg.pathways_head_mem}Gi"
         resources = {
             "requests": {"cpu": cpu_req, "memory": mem_req},
             "limits": {"cpu": cpu_req, "memory": mem_req},
         }
-        return dict(
-            name=cfg.name,
-            image=cfg.image_id or self._bundler.id(cfg.name),
-            command=["bash", "-c", cfg.command],
+        container = dict(
+            name=inner_cfg.name,
+            image=inner_cfg.image_id or self._bundler.id(inner_cfg.name),
+            command=["bash", "-c", inner_cfg.command],
             env=[
                 {
                     "name": "XCLOUD_ENVIRONMENT",
@@ -1089,10 +1122,38 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             ],
             imagePullPolicy="Always",
             resources=resources,
-            ports=(
-                [dict(containerPort=self.config.target_port)] if self.config.enable_service else []
-            ),
+            ports=([dict(containerPort=cfg.target_port)] if cfg.enable_service else []),
         )
+
+        # Add health probes for inference pods when service is enabled.
+        # This ensures K8s services only route traffic to healthy pods that have
+        # finished loading models and are ready to serve requests.
+        if cfg.enable_service:
+            # startupProbe: Allows long startup time for model loading.
+            # Max startup time = failureThreshold * periodSeconds.
+            container["startupProbe"] = {
+                "httpGet": {
+                    "path": cfg.health_check_path,
+                    "port": cfg.health_check_port,
+                },
+                "initialDelaySeconds": 30,
+                "periodSeconds": 10,
+                "timeoutSeconds": 5,
+                "failureThreshold": cfg.startup_probe_failure_threshold,
+            }
+            # readinessProbe: Checks if the pod is ready to receive traffic.
+            # Once startup completes, this probe runs to determine traffic routing.
+            container["readinessProbe"] = {
+                "httpGet": {
+                    "path": cfg.health_check_path,
+                    "port": cfg.health_check_port,
+                },
+                "periodSeconds": 10,
+                "timeoutSeconds": 5,
+                "failureThreshold": 3,
+            }
+
+        return container
 
     def build_leader_pod(self) -> Nested[Any]:
         # pylint: disable-next=protected-access

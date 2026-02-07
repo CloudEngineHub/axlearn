@@ -20,7 +20,7 @@ evalers['train'].eval_policy.n: 25000
 evalers['train'].input.batcher.fn: 'axlearn.common.input_tf_data.per_feed_batch'
 evalers['train'].input.batcher.pad_example_fn: 'axlearn.common.input_tf_data.default_pad_example_fn'
 evalers['train'].input.batcher.prefetch_buffer_size: -1
-evalers['train'].input.input_dispatcher.global_logical_batch_size: 1024
+evalers['train'].input.input_dispatcher.global_logical_batch_size: 512
 evalers['train'].input.input_dispatcher.klass: 'axlearn.common.input_dispatch.SpmdInputDispatcher'
 evalers['train'].input.input_dispatcher.partition_spec: PartitionSpec(('data', 'expert', 'fsdp'),)
 evalers['train'].input.is_training: False
@@ -29,7 +29,7 @@ evalers['train'].input.processor.fn: 'axlearn.common.input_tf_data.identity'
 evalers['train'].input.source.dataset_name: 'c4/en:3.0.1'
 evalers['train'].input.source.fn: 'axlearn.experiments.text.gpt.common.tfds_input'
 evalers['train'].input.source.is_training: False
-evalers['train'].input.source.max_sequence_length: 8192
+evalers['train'].input.source.max_sequence_length: 32768
 evalers['train'].input.source.replace_newlines_with: '\n'
 evalers['train'].input.source.split: 'train[:8192]'
 evalers['train'].input.source.train_shuffle_buffer_size: 16384
@@ -49,7 +49,7 @@ evalers['validation'].eval_policy.n: 25000
 evalers['validation'].input.batcher.fn: 'axlearn.common.input_tf_data.per_feed_batch'
 evalers['validation'].input.batcher.pad_example_fn: 'axlearn.common.input_tf_data.default_pad_example_fn'
 evalers['validation'].input.batcher.prefetch_buffer_size: -1
-evalers['validation'].input.input_dispatcher.global_logical_batch_size: 1024
+evalers['validation'].input.input_dispatcher.global_logical_batch_size: 512
 evalers['validation'].input.input_dispatcher.klass: 'axlearn.common.input_dispatch.SpmdInputDispatcher'
 evalers['validation'].input.input_dispatcher.partition_spec: PartitionSpec(('data', 'expert', 'fsdp'),)
 evalers['validation'].input.is_training: False
@@ -58,7 +58,7 @@ evalers['validation'].input.processor.fn: 'axlearn.common.input_tf_data.identity
 evalers['validation'].input.source.dataset_name: 'c4/en:3.0.1'
 evalers['validation'].input.source.fn: 'axlearn.experiments.text.gpt.common.tfds_input'
 evalers['validation'].input.source.is_training: False
-evalers['validation'].input.source.max_sequence_length: 8192
+evalers['validation'].input.source.max_sequence_length: 32768
 evalers['validation'].input.source.replace_newlines_with: '\n'
 evalers['validation'].input.source.split: 'validation'
 evalers['validation'].input.source.train_shuffle_buffer_size: 16384
@@ -73,7 +73,7 @@ evalers['validation'].summary_writer.write_every_n_steps: 1
 input.batcher.fn: 'axlearn.common.input_tf_data.per_feed_batch'
 input.batcher.pad_example_fn: 'axlearn.common.input_tf_data.default_pad_example_fn'
 input.batcher.prefetch_buffer_size: -1
-input.input_dispatcher.global_logical_batch_size: 1024
+input.input_dispatcher.global_logical_batch_size: 512
 input.input_dispatcher.klass: 'axlearn.common.input_dispatch.SpmdInputDispatcher'
 input.input_dispatcher.partition_spec: PartitionSpec(('data', 'expert', 'fsdp'),)
 input.input_partitioner.fn: 'axlearn.common.input_base.partition_by_path_rank'
@@ -88,7 +88,7 @@ input.source.data_mixture_components[0]['shuffle_buffer_size']: 8192
 input.source.data_mixture_components[0]['split']: 'train'
 input.source.data_mixture_components[0]['info']: ''
 input.source.fn: 'axlearn.experiments.text.gpt.common.mixture_train_input_source'
-input.source.max_sequence_length: 8192
+input.source.max_sequence_length: 32768
 input.source.preprocessor.fn: 'axlearn.common.input_lm.lm_text_preprocessor'
 input.source.preprocessor.max_padding_fraction: 0.5
 input.source.preprocessor.shuffle_buffer_size: 8192
@@ -144,23 +144,47 @@ mesh_axis_names[3]: 'fsdp'
 mesh_axis_names[4]: 'seq'
 mesh_axis_names[5]: 'model'
 mesh_rules[0][0]: 'tpu-v5p-(1024|2048)'
-mesh_rules[0][1][0]: 1
-mesh_rules[0][1][1]: -1
-mesh_rules[0][1][2]: 1
-mesh_rules[0][1][3]: 8
-mesh_rules[0][1][4]: 1
-mesh_rules[0][1][5]: 1
-mesh_rules[1][0]: 'gpu-(p5.48xlarge|p4de.24xlarge|a3-highgpu-8g)-64'
-mesh_rules[1][1][0]: 1
-mesh_rules[1][1][1]: -1
-mesh_rules[1][1][2]: 1
-mesh_rules[1][1][3]: 8
-mesh_rules[1][1][4]: 1
-mesh_rules[1][1][5]: 1
+mesh_rules[0][1].config_modifiers[0].klass: 'axlearn.common.trainer_config_modifier.MeshShapeModifier'
+mesh_rules[0][1].config_modifiers[0].mesh_shape[0]: 1
+mesh_rules[0][1].config_modifiers[0].mesh_shape[1]: -1
+mesh_rules[0][1].config_modifiers[0].mesh_shape[2]: 1
+mesh_rules[0][1].config_modifiers[0].mesh_shape[3]: 8
+mesh_rules[0][1].config_modifiers[0].mesh_shape[4]: 1
+mesh_rules[0][1].config_modifiers[0].mesh_shape[5]: 1
+mesh_rules[0][1].config_modifiers[1].klass: 'axlearn.common.trainer_config_modifier.RematSpecModifier'
+mesh_rules[0][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['prevent_cse']: False
+mesh_rules[0][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].fn: 'axlearn.common.utils.save_and_offload_only_these_names_regex'
+mesh_rules[0][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].names_which_can_be_offloaded: '.*[kqv]_proj|.*linear1_[01]|.*gate_weights|.*gate_assignment'
+mesh_rules[0][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].names_which_can_be_saved: '.*flash_residuals'
+mesh_rules[0][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].offload_dst: 'pinned_host'
+mesh_rules[0][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].offload_src: 'device'
+mesh_rules[0][1].klass: 'axlearn.common.trainer_config_modifier.ChainConfigModifier'
+mesh_rules[1][0]: 'gpu-(p6-b200.48xlarge|p5.48xlarge|p4de.24xlarge|a3-highgpu-8g)-512'
+mesh_rules[1][1].config_modifiers[0].klass: 'axlearn.common.trainer_config_modifier.MeshShapeModifier'
+mesh_rules[1][1].config_modifiers[0].mesh_shape['ici_mesh_shape'][0]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['ici_mesh_shape'][1]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['ici_mesh_shape'][2]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['ici_mesh_shape'][3]: 8
+mesh_rules[1][1].config_modifiers[0].mesh_shape['ici_mesh_shape'][4]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['ici_mesh_shape'][5]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['dcn_mesh_shape'][0]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['dcn_mesh_shape'][1]: -1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['dcn_mesh_shape'][2]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['dcn_mesh_shape'][3]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['dcn_mesh_shape'][4]: 1
+mesh_rules[1][1].config_modifiers[0].mesh_shape['dcn_mesh_shape'][5]: 1
+mesh_rules[1][1].config_modifiers[1].klass: 'axlearn.common.trainer_config_modifier.RematSpecModifier'
+mesh_rules[1][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['prevent_cse']: False
+mesh_rules[1][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].fn: 'axlearn.common.utils.save_and_offload_only_these_names_regex'
+mesh_rules[1][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].names_which_can_be_offloaded: ''
+mesh_rules[1][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].names_which_can_be_saved: '.*flash_residuals|.*[kqv]_proj|.*o_proj|.*linear1_[01]|.*linear2(_[01])?|.*gate_weights|.*gate_assignment'
+mesh_rules[1][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].offload_dst: 'pinned_host'
+mesh_rules[1][1].config_modifiers[1].remat_policies['model.decoder.transformer.layer']['policy'].offload_src: 'device'
+mesh_rules[1][1].klass: 'axlearn.common.trainer_config_modifier.ChainConfigModifier'
 mesh_shape[0]: 1
 mesh_shape[1]: -1
 mesh_shape[2]: 1
-mesh_shape[3]: 1
+mesh_shape[3]: 8
 mesh_shape[4]: 1
 mesh_shape[5]: 1
 model.batch_axis_names[0]: 'data'
@@ -209,8 +233,8 @@ model.decoder.transformer.layer.feed_forward.activation[0]: 'nn.silu'
 model.decoder.transformer.layer.feed_forward.activation[1]: 'linear'
 model.decoder.transformer.layer.feed_forward.corr_loss_weight: 0
 model.decoder.transformer.layer.feed_forward.dim_to_mesh_axis_map['me']: PartitionSpec(None, None)
-model.decoder.transformer.layer.feed_forward.dim_to_mesh_axis_map['emh']: PartitionSpec('expert', 'fsdp', 'model')
-model.decoder.transformer.layer.feed_forward.dim_to_mesh_axis_map['ehm']: PartitionSpec('expert', 'model', 'fsdp')
+model.decoder.transformer.layer.feed_forward.dim_to_mesh_axis_map['emh']: PartitionSpec('expert', ('fsdp', 'seq'), 'model')
+model.decoder.transformer.layer.feed_forward.dim_to_mesh_axis_map['ehm']: PartitionSpec('expert', 'model', ('fsdp', 'seq'))
 model.decoder.transformer.layer.feed_forward.dropout.klass: 'axlearn.common.layers.Dropout'
 model.decoder.transformer.layer.feed_forward.gating.gating_logit_cap: 0.0
 model.decoder.transformer.layer.feed_forward.gating.klass: 'axlearn.common.mixture_of_experts.TopKDropFreeGating'
@@ -236,12 +260,13 @@ model.decoder.transformer.layer.feed_forward.router_z_loss_weight: 0.0
 model.decoder.transformer.layer.feed_forward.stochastic_depth.klass: 'axlearn.common.layers.StochasticDepth'
 model.decoder.transformer.layer.feed_forward.stochastic_depth.mode: 'row'
 model.decoder.transformer.layer.feed_forward.structure: 'prenorm'
-model.decoder.transformer.layer.feed_forward.tiling[0]: 512
+model.decoder.transformer.layer.feed_forward.tiling[0]: 128
 model.decoder.transformer.layer.feed_forward.tiling[1]: 512
 model.decoder.transformer.layer.feed_forward.tiling[2]: 512
 model.decoder.transformer.layer.klass: 'axlearn.common.attention.TransformerLayer'
 model.decoder.transformer.layer.remat_spec['prevent_cse']: False
-model.decoder.transformer.layer.remat_spec['policy']: 'jax._src.ad_checkpoint.dots_saveable'
+model.decoder.transformer.layer.remat_spec['policy']: 'axlearn.common.flash_attention.remat.policy'
+model.decoder.transformer.layer.self_attention.attention.backend_overrides['splash_use_fused_bwd_kernel']: True
 model.decoder.transformer.layer.self_attention.attention.causal: True
 model.decoder.transformer.layer.self_attention.attention.dropout.klass: 'axlearn.common.layers.Dropout'
 model.decoder.transformer.layer.self_attention.attention.hidden_dim: 4096
@@ -285,7 +310,7 @@ model.decoder.transformer.layer.self_attention.attention.query_scale.klass: 'axl
 model.decoder.transformer.layer.self_attention.attention.query_scale.norm.eps: 1e-06
 model.decoder.transformer.layer.self_attention.attention.query_scale.norm.forward_dtype: 'jax.numpy.float32'
 model.decoder.transformer.layer.self_attention.attention.query_scale.norm.klass: 'axlearn.common.layers.RMSNorm'
-model.decoder.transformer.layer.self_attention.attention.tpu_block_size: 512
+model.decoder.transformer.layer.self_attention.attention.tpu_block_size: 2048
 model.decoder.transformer.layer.self_attention.dropout.klass: 'axlearn.common.layers.Dropout'
 model.decoder.transformer.layer.self_attention.klass: 'axlearn.common.attention.TransformerAttentionLayer'
 model.decoder.transformer.layer.self_attention.norm.eps: 1e-06
