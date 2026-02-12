@@ -18,6 +18,8 @@ from axlearn.cloud.gcp.pathways_utils import (
     _PATHWAYS_PROXY_CONTAINER_NAME,
     _PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
     _PATHWAYS_SERVER_IMAGE,
+    NOTARY_PROXY_GRPC_PORT,
+    NOTARY_PROXY_HTTP_PORT,
     get_megascale_options,
     get_xla_options,
 )
@@ -55,6 +57,11 @@ class SplitXLAMXLAFlagsTest(TestCase):
         megascale_options = get_megascale_options(default_options)
         xla_options = get_xla_options(default_options)
         self.assertEqual(len(megascale_options) + len(xla_options), len(default_options))
+
+
+class MockUserCommandPatcher(jobset_utils.UserCommandPatcher):
+    def patch(self, command: str, **kwargs: dict) -> str:
+        return f"./prefix_command.sh; {command}"
 
 
 class PathwaysReplicatedJobTest(TestCase):
@@ -147,6 +154,13 @@ class PathwaysReplicatedJobTest(TestCase):
                     "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY",
                 }.issubset(env_vars)
             )
+
+            # Check security context for SYS_PTRACE capability
+            self.assertIn("securityContext", head_container)
+            security_context = head_container["securityContext"]
+            self.assertIn("capabilities", security_context)
+            self.assertIn("add", security_context["capabilities"])
+            self.assertIn("SYS_PTRACE", security_context["capabilities"]["add"])
 
             # Check pathways-proxy container args for XLA flags.
             proxy_container = None
@@ -408,18 +422,23 @@ class PathwaysMultiheadReplicatedJobTest(TestCase):
             bundler_cfg = bundler_cls.from_spec([], fv=fv).set(image="test-image")
             yield cfg, bundler_cfg
 
-    @parameterized.parameters([1, 2])
-    def test_replicated_job(self, num_replicas):
+    @parameterized.product(
+        num_replicas=[1, 2], user_command_patcher=[None, MockUserCommandPatcher.default_config()]
+    )
+    def test_replicated_job(self, num_replicas, user_command_patcher):
         with (self._job_config(CloudBuildBundler, num_replicas) as (cfg, bundler_cfg),):
+            command = "test_command"
             cfg.inner.set(
                 project="test-project",
                 name="test",
-                command="test_command",
+                command=command,
                 output_dir="FAKE",
-            ).instantiate(bundler=bundler_cfg.instantiate())
+            )
+            if user_command_patcher:
+                cfg.inner.set(user_command_patcher=user_command_patcher)
+            cfg.instantiate(bundler=bundler_cfg.instantiate())
 
             builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
-
             replicated_jobs = builder()
 
             self.assertEqual(len(replicated_jobs), num_replicas + 1)
@@ -448,6 +467,29 @@ class PathwaysMultiheadReplicatedJobTest(TestCase):
                     self.assertEqual(replicated_job["replicas"], num_replicas)
                 elif replicated_job_name.startswith("pwwk"):
                     self.assertEqual(replicated_job["replicas"], 1)
+
+                command_was_patched = False
+
+                if replicated_job_name.startswith("pwhd"):
+                    containers = (
+                        job_spec.get("spec", {})
+                        .get("template", {})
+                        .get("spec", {})
+                        .get("containers", [])
+                    )
+                    if containers and len(containers) > 0:
+                        command_parts = containers[0].get("command", [])
+                        if command_parts and len(command_parts) > 0:
+                            the_command = command_parts[-1]
+                            if user_command_patcher:
+                                self.assertEqual(f"./prefix_command.sh; {command}", the_command)
+                                command_was_patched = True
+                            else:
+                                self.assertEqual(command, the_command)
+                self.assertEqual(
+                    user_command_patcher is not None and replicated_job_name.startswith("pwhd"),
+                    command_was_patched,
+                )
 
     def test_validate_head_name(self):
         with self._job_config(CloudBuildBundler, 2) as (cfg, bundler_cfg):
@@ -614,7 +656,7 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
         with (
             self._job_config(
                 CloudBuildBundler,
-                enable_service=True,
+                enable_health_probes=True,
                 health_check_path=health_check_path,
                 health_check_port=health_check_port,
                 startup_probe_failure_threshold=startup_probe_failure_threshold,
@@ -628,6 +670,7 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
             ).instantiate(bundler=bundler_cfg.instantiate())
 
             builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+
             # pylint: disable-next=protected-access
             container = builder._build_head_container()
 
@@ -646,12 +689,12 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
             # readinessProbe failureThreshold is always 3
             self.assertEqual(readiness_probe["failureThreshold"], 3)
 
-    def test_no_health_probes_when_service_disabled(self):
-        """Tests that health probes are not added when enable_service is False."""
+    def test_no_health_probes_when_readiness_probe_disabled(self):
+        """Tests that health probes are not added when enable_health_probes is False."""
         with (
             self._job_config(
                 CloudBuildBundler,
-                enable_service=False,
+                enable_health_probes=False,
             ) as (cfg, bundler_cfg),
         ):
             cfg.inner.set(
@@ -668,3 +711,53 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
             # Verify no health probes are present
             self.assertNotIn("startupProbe", container)
             self.assertNotIn("readinessProbe", container)
+
+    @parameterized.parameters([True, False])
+    def test_gke_gateway_route_notary_containers(self, gke_gateway_route):
+        """Tests that notary-proxy containers are added when gke_gateway_route=True."""
+        with (
+            self._job_config(
+                CloudBuildBundler,
+                gke_gateway_route=gke_gateway_route,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="test-express-route",
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = builder.build_leader_pod()
+            pod_spec = pod["spec"]
+
+            container_names = [c["name"] for c in pod_spec["containers"]]
+
+            # pathways-proxy and pathways-rm should always be present
+            self.assertIn(_PATHWAYS_PROXY_CONTAINER_NAME, container_names)
+            self.assertIn(_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME, container_names)
+
+            if gke_gateway_route:
+                # When gke_gateway_route=True, notary-proxy containers should be present
+                self.assertEqual(len(pod_spec["containers"]), 5)
+                self.assertIn("notary-proxy", container_names)
+                self.assertIn("notary-proxy-grpc", container_names)
+
+                # Check notary-proxy container ports
+                notary_http = next(c for c in pod_spec["containers"] if c["name"] == "notary-proxy")
+                notary_grpc = next(
+                    c for c in pod_spec["containers"] if c["name"] == "notary-proxy-grpc"
+                )
+                self.assertEqual(notary_http["ports"][0]["containerPort"], NOTARY_PROXY_HTTP_PORT)
+                self.assertEqual(notary_grpc["ports"][0]["containerPort"], NOTARY_PROXY_GRPC_PORT)
+
+                # Check ConfigMap volumes are present
+                volume_names = [v["name"] for v in pod_spec["volumes"]]
+                self.assertIn("notary-proxy-config-sidecar", volume_names)
+                self.assertIn("notary-proxy-config-sidecar-grpc", volume_names)
+            else:
+                # When gke_gateway_route=False, notary-proxy containers should NOT be present
+                self.assertEqual(len(pod_spec["containers"]), 3)
+                self.assertNotIn("notary-proxy", container_names)
+                self.assertNotIn("notary-proxy-grpc", container_names)

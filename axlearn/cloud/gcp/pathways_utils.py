@@ -3,13 +3,19 @@
 """Utilities for building Pathways Jobset specs."""
 
 import copy
+import io
 import logging
 import os
 from typing import Any, Optional, Sequence, Union
 
 from absl import flags
 
-from axlearn.cloud.common.bastion import BASTION_JOB_VERSION_ENV_VAR
+from axlearn.cloud.common.bastion import (
+    _BASTION_SERIALIZED_JOBSPEC_ENV_VAR,
+    BASTION_JOB_VERSION_ENV_VAR,
+    ValidationError,
+    deserialize_jobspec,
+)
 from axlearn.cloud.common.bundler import Bundler
 from axlearn.cloud.common.utils import parse_kv_flags
 from axlearn.cloud.gcp.jobset_utils import (
@@ -86,6 +92,11 @@ _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE = "workload"
 # Note that the head pod will back of exact this many times.
 # While workers will share #workers * _PATHWAYS_BACK_OFF_LIMIT total times.
 _PATHWAYS_BACK_OFF_LIMIT = 32
+
+# Notary proxy configuration for gke_gateway_route
+NOTARY_PROXY_IMAGE = "docker.apple.com/polymer/notary-proxy:44d03e27b8c9"
+NOTARY_PROXY_HTTP_PORT = 38081
+NOTARY_PROXY_GRPC_PORT = 39001
 
 
 def get_colocated_python_image(image_id: str) -> str:
@@ -423,6 +434,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "requests": {"cpu": cpu_req, "memory": mem_req},
         }
         head_container["resources"] = resources
+
+        # This enables tracing tools like pyspy
+        head_container["securityContext"] = {"capabilities": {"add": ["SYS_PTRACE"]}}
 
         volume_mounts = head_container.get("volumeMounts", [])
         volume_mounts.append(dict(name="shared-memory", mountPath="/tmp/ifrt_proxy"))
@@ -883,6 +897,8 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
 
         target_port: Optional[int] = None
         enable_service: bool = None
+        gke_gateway_route: bool = None
+        enable_health_probes: Optional[bool] = None
 
         # Health probe configuration for inference pods.
         # - startup_probe_failure_threshold: Max consecutive failures before probe fails.
@@ -928,10 +944,22 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             "Whether to enable creation of service for LWS",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "enable_health_probes",
+            False,
+            "Whether to enable health probes for LWS service",
+            **common_kwargs,
+        )
         flags.DEFINE_integer(
             "target_port",
             None,
             "port where a service can access application, set at head container",
+            **common_kwargs,
+        )
+        flags.DEFINE_boolean(
+            "gke_gateway_route",
+            False,
+            "Enable express route with notary-proxy sidecars for direct gateway routing",
             **common_kwargs,
         )
         flags.DEFINE_integer(
@@ -962,6 +990,8 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
         fv.set_default("target_port", fv.target_port or 9000)
         fv.set_default("enable_service", fv.enable_service or False)
+        fv.set_default("gke_gateway_route", fv.gke_gateway_route or False)
+        fv.set_default("enable_health_probes", fv.enable_health_probes or False)
 
     @classmethod
     def default_config(cls):
@@ -977,6 +1007,8 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
 
         self._bundler = bundler
         self._inner: TPULeaderWorkerTemplate = cfg.inner.instantiate(bundler=self._bundler)
+        self._inner._user_command_patcher = self._user_command_patcher
+
         self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
             raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
@@ -1085,6 +1117,105 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
         )
 
+    def _build_notary_sidecar_containers(self) -> list[Nested[Any]]:
+        """Builds notary-proxy sidecar containers for gke_gateway_route.
+
+        Returns two containers:
+        - notary-proxy for HTTP traffic (port 8081)
+        - notary-proxy-grpc for GRPC traffic (port 9001)
+        """
+        containers = []
+
+        # Common probe settings
+        def build_probes(port: int) -> dict:
+            return {
+                "livenessProbe": {
+                    "tcpSocket": {"port": port},
+                    "initialDelaySeconds": 30,
+                    "periodSeconds": 15,
+                    "timeoutSeconds": 10,
+                    "failureThreshold": 10,
+                },
+                "readinessProbe": {
+                    "tcpSocket": {"port": port},
+                    "initialDelaySeconds": 5,
+                    "periodSeconds": 10,
+                    "timeoutSeconds": 10,
+                    "failureThreshold": 10,
+                },
+                "startupProbe": {
+                    "tcpSocket": {"port": port},
+                    "initialDelaySeconds": 0,
+                    "periodSeconds": 10,
+                    "timeoutSeconds": 10,
+                    "failureThreshold": 60,
+                },
+            }
+
+        # HTTP notary-proxy container
+        http_container = {
+            "name": "notary-proxy",
+            "image": NOTARY_PROXY_IMAGE,
+            "imagePullPolicy": "Always",
+            "command": ["/app/notary-proxy"],
+            "env": [
+                {"name": "PORT", "value": str(NOTARY_PROXY_HTTP_PORT)},
+                {
+                    "name": "NOTARY_APP_PASSWORD",
+                    "valueFrom": {
+                        "secretKeyRef": {"name": "notary-proxy", "key": "NOTARY_APP_PASSWORD"}
+                    },
+                },
+            ],
+            "ports": [{"containerPort": NOTARY_PROXY_HTTP_PORT, "name": "proxy"}],
+            "resources": {
+                "limits": {"cpu": "8", "memory": "8Gi"},
+                "requests": {"cpu": "1", "memory": "4Gi"},
+            },
+            "volumeMounts": [
+                {
+                    "name": "notary-proxy-config-sidecar",
+                    "mountPath": "/app/configs/notary-proxy.yml",
+                    "subPath": "notary-proxy.yml",
+                }
+            ],
+            **build_probes(NOTARY_PROXY_HTTP_PORT),
+        }
+        containers.append(http_container)
+
+        # GRPC notary-proxy container
+        grpc_container = {
+            "name": "notary-proxy-grpc",
+            "image": NOTARY_PROXY_IMAGE,
+            "imagePullPolicy": "Always",
+            "command": ["/app/notary-proxy"],
+            "env": [
+                {"name": "PORT", "value": str(NOTARY_PROXY_GRPC_PORT)},
+                {
+                    "name": "NOTARY_APP_PASSWORD",
+                    "valueFrom": {
+                        "secretKeyRef": {"name": "notary-proxy", "key": "NOTARY_APP_PASSWORD"}
+                    },
+                },
+            ],
+            "ports": [{"containerPort": NOTARY_PROXY_GRPC_PORT, "name": "proxy"}],
+            "resources": {
+                "limits": {"cpu": "8", "memory": "8Gi"},
+                "requests": {"cpu": "1", "memory": "4Gi"},
+            },
+            "volumeMounts": [
+                {
+                    "name": "notary-proxy-config-sidecar-grpc",
+                    "mountPath": "/app/configs/notary-proxy.yml",
+                    "subPath": "notary-proxy.yml",
+                }
+            ],
+            **build_probes(NOTARY_PROXY_GRPC_PORT),
+        }
+        containers.append(grpc_container)
+
+        return containers
+
     def _build_head_container(self) -> dict:
         cfg: PathwaysLeaderWorkerTemplate.Config = self.config
         inner_cfg: TPULeaderWorkerTemplate.Config = self._inner.config
@@ -1094,10 +1225,25 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             "requests": {"cpu": cpu_req, "memory": mem_req},
             "limits": {"cpu": cpu_req, "memory": mem_req},
         }
+        command = inner_cfg.command
+
+        if self._user_command_patcher is not None:
+            user_id = None
+            job_spec = os.environ.get(_BASTION_SERIALIZED_JOBSPEC_ENV_VAR)
+            if job_spec:
+                try:
+                    spec = deserialize_jobspec(io.StringIO(job_spec))
+                    user_id = spec.metadata.user_id
+                except ValidationError:
+                    logging.debug("Failed to deserialize job spec for user command patching.")
+            command = self._user_command_patcher.patch(command, user_id=user_id)
+
         container = dict(
             name=inner_cfg.name,
             image=inner_cfg.image_id or self._bundler.id(inner_cfg.name),
-            command=["bash", "-c", inner_cfg.command],
+            # This enables tracing tools like pyspy
+            securityContext={"capabilities": {"add": ["SYS_PTRACE"]}},
+            command=["bash", "-c", command],
             env=[
                 {
                     "name": "XCLOUD_ENVIRONMENT",
@@ -1128,7 +1274,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         # Add health probes for inference pods when service is enabled.
         # This ensures K8s services only route traffic to healthy pods that have
         # finished loading models and are ready to serve requests.
-        if cfg.enable_service:
+        if cfg.enable_health_probes:
             # startupProbe: Allows long startup time for model loading.
             # Max startup time = failureThreshold * periodSeconds.
             container["startupProbe"] = {
@@ -1186,6 +1332,23 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             self._build_pathways_proxy_container(),
             self._build_pathways_rm_container(),
         ]
+
+        # Add notary-proxy sidecars when gke_gateway_route is enabled
+        if self.config.gke_gateway_route:
+            containers.extend(self._build_notary_sidecar_containers())
+            # Add ConfigMap volumes for notary-proxy
+            volumes.append(
+                dict(
+                    name="notary-proxy-config-sidecar",
+                    configMap=dict(name="notary-proxy-config-sidecar"),
+                )
+            )
+            volumes.append(
+                dict(
+                    name="notary-proxy-config-sidecar-grpc",
+                    configMap=dict(name="notary-proxy-config-sidecar-grpc"),
+                )
+            )
 
         metadata_host_alias = dict(
             ip=_METADATA_GOOGLE_INTERNAL_IP,
