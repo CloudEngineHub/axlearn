@@ -12,7 +12,7 @@ import os
 import shlex
 import subprocess
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import kubernetes as k8s
 from absl import flags
@@ -27,12 +27,18 @@ from axlearn.cloud.gcp.k8s_health_check_policy import LWSHealthCheckPolicy
 from axlearn.cloud.gcp.k8s_http_route import LWSHTTPRoute
 from axlearn.cloud.gcp.k8s_service import LWSService
 from axlearn.cloud.gcp.lws_utils import BaseLeaderWorkerTemplate
+from axlearn.cloud.gcp.system_characteristics import (
+    _SystemCharacteristics,
+    get_subblock_characteristics,
+    get_system_characteristics,
+)
 from axlearn.cloud.gcp.utils import (
     custom_jobset_kwargs,
     custom_leaderworkerset_kwargs,
     delete_k8s_jobset,
     delete_k8s_leaderworkerset,
 )
+from axlearn.common.compiler_options import infer_tpu_version
 from axlearn.common.config import REQUIRED, ConfigOr, Required, config_class, maybe_instantiate
 from axlearn.common.utils import Nested
 
@@ -52,6 +58,42 @@ class _ServiceType(enum.Enum):
     NODE_PORT = "NodePort"
     LOAD_BALANCER = "LoadBalancer"
     EXTERNAL_NAME = "ExternalName"
+
+
+def get_topology_assignment() -> Optional[list[list[str]]]:
+    """Retrieves TPU topology assignments from the environment variable.
+
+    When TPU slice auto-provisioning is enabled, Bastion passes topology assignments
+    through an environment variable. These assignments specify which TPU slices should be
+    used for the job, enabling precise control over TPU resource allocation.
+
+    Example topology assignment:
+        [["sub-block-id", "sub-block-id"]]
+
+    This is the assignment for a job asking for tpu-7x-256, that needs 128 chips, using
+    2 sub-blocks (64 chips per sub-block). This job will run on a TPU slice formed by
+    2 sub-blocks. Each inner array represents the TPU slice info for a job's replica.
+
+    Returns:
+        A list of lists of strings representing topology assignments, where each inner list
+        contains slice identifiers for a particular job replica. Returns None if the
+        environment variable is not set or if parsing fails.
+    """
+    topology_assignments_env = os.environ.get(BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR)
+    if not topology_assignments_env:
+        logging.info("No %s environment variable set.", BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR)
+        return None
+
+    try:
+        return json.loads(topology_assignments_env)
+    except json.JSONDecodeError as e:
+        logging.warning(
+            "Failed to parse topology assignments from env var %s, value: %s, error: %s",
+            BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR,
+            topology_assignments_env,
+            e,
+        )
+        return None
 
 
 class GCPJob(Job):
@@ -167,76 +209,160 @@ class GKEJob(GCPJob):
         # fully blocking; after the call returns there can be a delay before everything is deleted.
         delete_k8s_jobset(cfg.name, namespace=cfg.namespace)
 
-    def _get_topology_assignment(self) -> Optional[list[list[str]]]:
-        """Retrieves TPU topology assignments from the environment variable.
+    def _lookup_system_by_node_selectors(
+        self, node_selector: dict[str, str]
+    ) -> Optional[tuple[str, _SystemCharacteristics]]:
+        """Looks up system characteristics from node selectors.
 
-        When TPU slice auto-provisioning is enabled, Bastion passes topology assignments
-        through an environment variable. These assignments specify which TPU slices should be
-        used for the job, enabling precise control over TPU resource allocation.
-
-        Example topology assignment:
-            [["sub-block-id", "sub-block-id"]]
-
-        This is the assignment for a job asking for tpu-7x-256, that needs 128 chips, using
-        2 sub-blocks (64 chips per sub-block). This job will run on a TPU slice formed by
-        2 sub-blocks. Each inner array represents the TPU slice info for a job's replica.
+        Args:
+            node_selector: Kubernetes node selector dict
 
         Returns:
-            A list of lists of strings representing topology assignments, where each inner list
-            contains slice identifiers for a particular job replica. Returns None if the
-            environment variable is not set or if parsing fails.
+            Tuple of tpu type and _SystemCharacteristics object if TPU selectors found
+            None otherwise.
         """
-        topology_assignments_env = os.environ.get(BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR)
-        if not topology_assignments_env:
-            logging.info("No %s environment variable set.", BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR)
+        gke_accelerator = node_selector.get("cloud.google.com/gke-tpu-accelerator")
+        topology = node_selector.get("cloud.google.com/gke-tpu-topology")
+
+        if not (gke_accelerator and topology):
             return None
 
-        try:
-            return json.loads(topology_assignments_env)
-        except json.JSONDecodeError as e:
-            logging.warning(
-                "Failed to parse topology assignments from env var %s, value: %s, error: %s",
-                BASTION_JOB_TOPOLOGY_ASSIGNMENT_ENV_VAR,
-                topology_assignments_env,
-                e,
-            )
-            return None
+        return get_system_characteristics(gke_accelerator, topology)
 
-    def _get_tpu_job_name_from_replicated_jobs(
-        self, replicated_jobs: Sequence[Nested[Any]]
-    ) -> Optional[str]:
-        """Extracts the name of the replicated job that has TPU node selectors.
+    def _get_tpu_replicated_job_topology_selection(
+        self,
+        replicated_jobs: Sequence[Nested[Any]],
+        topology_assignments: list[list[str]],
+    ) -> dict[str, list[list[str]]]:
+        """Builds topology selection mapping from replicated jobs to subblock assignments.
 
-        Iterates through the replicated jobs and finds the one that contains
-        cloud.google.com/gke-tpu-accelerator and cloud.google.com/gke-tpu-topology
-        node selectors, which indicate it's a TPU job. Returns that jobs name.
+        This method analyzes TPU replicated jobs to determine their subblock requirements
+        and distributes topology assignments accordingly. It's used for TPU slice
+        auto-provisioning with super slicing support.
 
         Args:
             replicated_jobs: List of replicated job specs from the JobSet.
+            topology_assignments: List of subblock ID lists, where each inner list
+                represents subblocks for one replica. Format: [["sb-1", "sb-2"], ["sb-3"]].
 
         Returns:
-            The name of the replicated job that contains TPU node selectors,
-            or None if no such job is found.
+            A dict mapping replicated job name to its topology assignment. The topology
+            assignment is a list of lists, where each inner list contains subblock IDs
+            for a specific replica of that job.
+
+            Example return value:
+            {
+                "tpu-worker": [["sb-1", "sb-2"], ["sb-3", "sb-4"]]
+            }
+
+        Raises:
+            ValueError: If TPU version doesn't support subblock super slicing.
+            ValueError: If requested resources don't match topology assignments.
+            ValueError: If insufficient topology assignments are provided.
+            ValueError: If system lookup fails for job's node selectors.
         """
+        result = {}
+        used_indices = set()  # Track which assignments have been used
+
         for job in replicated_jobs:
-            # Navigate to the node selector in the job spec
-            # Structure: job -> template -> spec -> template -> spec -> nodeSelector
-            node_selector = (
+            # Extract node selector
+            node_selector: dict[str, str] = cast(
+                dict[str, str],
                 job.get("template", {})
                 .get("spec", {})
                 .get("template", {})
                 .get("spec", {})
-                .get("nodeSelector", {})
+                .get("nodeSelector", {}),
             )
 
-            # Check if TPU node selectors are present
-            has_tpu_accelerator = "cloud.google.com/gke-tpu-accelerator" in node_selector
-            has_tpu_topology = "cloud.google.com/gke-tpu-topology" in node_selector
+            # Look up system characteristics
+            gke_accelerator = node_selector.get("cloud.google.com/gke-tpu-accelerator")
+            topology = node_selector.get("cloud.google.com/gke-tpu-topology")
 
-            if has_tpu_accelerator and has_tpu_topology:
-                return str(job.get("name"))
+            if not (gke_accelerator and topology):
+                # Not a TPU job, skip
+                continue
 
-        return None
+            maybe_system_chars = self._lookup_system_by_node_selectors(node_selector)
+
+            if maybe_system_chars is None:
+                job_name = str(job.get("name"))
+                raise ValueError(
+                    f"Could not find system characteristics for job '{job_name}' with "
+                    f"accelerator='{gke_accelerator}' and topology='{topology}'. "
+                    f"This combination is not defined in "
+                    "USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS."
+                )
+
+            tpu_type, system_chars = maybe_system_chars
+            job_name = str(job.get("name"))
+            num_replicas = int(job.get("replicas", 1))
+
+            # Get TPU version and check for subblock support
+            tpu_version = infer_tpu_version(tpu_type)
+            subblock_chars = get_subblock_characteristics(tpu_version)
+
+            if subblock_chars is None:
+                raise ValueError(
+                    f"TPU version '{tpu_version}' (from device type '{system_chars.device_type}') "
+                    f"does not support subblock super slicing. Only TPU versions with configured "
+                    f"subblock mappings are supported for slice auto-provisioning."
+                )
+
+            # Calculate Subblocks
+            job_vms = system_chars.vms_per_slice
+            subblock_vms = subblock_chars.vms_per_slice
+
+            if job_vms % subblock_vms != 0:
+                raise ValueError(
+                    f"Job '{job_name}' requires {job_vms} VMs, which is not "
+                    f"evenly divisible by subblock size {subblock_vms} VMs. "
+                    f"Job topology: {topology}, Subblock topology: {subblock_chars.topology}"
+                )
+
+            # Calculate subblocks needed per replica
+            subblocks_per_replica = job_vms // subblock_vms
+
+            # Find matching assignments for each replica
+            job_assignments = []
+            for replica_idx in range(num_replicas):
+                # Find first unused assignment with correct number of subblocks
+                found_assignment = None
+                for idx, assignment in enumerate(topology_assignments):
+                    if idx not in used_indices and len(assignment) == subblocks_per_replica:
+                        found_assignment = assignment
+                        used_indices.add(idx)
+                        break
+
+                if found_assignment is None:
+                    raise ValueError(
+                        f"Could not find unused topology assignment with {subblocks_per_replica} "
+                        f"subblock(s) for job '{job_name}' replica {replica_idx}. "
+                        f"Total assignments: {len(topology_assignments)}, "
+                        f"already used: {len(used_indices)}."
+                    )
+
+                job_assignments.append(found_assignment)
+
+            result[job_name] = job_assignments
+            logging.info(
+                "Job '%s' (%s, topology=%s): %d replica(s) × %d subblock(s)",
+                job_name,
+                system_chars.device_type,
+                topology,
+                num_replicas,
+                subblocks_per_replica,
+            )
+
+        # Check if there are unused topology assignments
+        if len(used_indices) < len(topology_assignments):
+            logging.warning(
+                "Not all topology assignments were consumed. Used %d out of %d assignment(s).",
+                len(used_indices),
+                len(topology_assignments),
+            )
+
+        return result
 
     def _build_jobset(self) -> Nested[Any]:
         """Builds a config for a JobSet, which is a set of Jobs.
@@ -257,16 +383,12 @@ class GKEJob(GCPJob):
         # Bastion passes the job metadata to the runner through env vars
         # If the job has topology assigned, its also in the env var
         # Try to parse the env var and get the topology assignments.
-        topology_assignment = self._get_topology_assignment()
+        topology_assignment = get_topology_assignment()
         if cfg.enable_tpu_slice_auto_provisioning and topology_assignment:
-            # Get the TPU job name from the replicated jobs
-            tpu_job_name = self._get_tpu_job_name_from_replicated_jobs(replicated_jobs)
-            if tpu_job_name is None:
-                logging.warning(
-                    "TPU slice auto-provisioning enabled but no TPU job found in replicated jobs"
-                )
-                tpu_job_name = self._builder.config.job_name  # Fallback to builder job name
-            slice_selection = json.dumps({tpu_job_name: topology_assignment})
+            slice_selection_dict = self._get_tpu_replicated_job_topology_selection(
+                replicated_jobs, topology_assignment
+            )
+            slice_selection = json.dumps(slice_selection_dict)
             logging.info("Adding slice selection: %s to job set", slice_selection)
             labels.update({"tpu-provisioner.cloud.google.com/slice-autoprovisioning": "sync"})
             annotations.update(
@@ -425,12 +547,14 @@ class GKELeaderWorkerSet(GCPJob):
             builder: A builder that returns one or more statefulset specs.
             namespace: The namespace to use within the k8s cluster.
             annotations: LeaderWorkerSet annotations.
+            labels: LeaderWorkerSet labels.
             num_replicas: number of LWS replicas.
         """
 
         builder: Required[BaseLeaderWorkerTemplate.Config] = REQUIRED
         namespace: str = "default"
         annotations: Optional[ConfigOr[dict]] = None
+        labels: Optional[ConfigOr[dict]] = None
         num_replicas: int = 1
         enable_service: bool = False
         ports: list[str] = None
@@ -442,6 +566,7 @@ class GKELeaderWorkerSet(GCPJob):
         gke_gateway_route: bool = False
         http_route: Optional[LWSHTTPRoute.Config] = None
         health_check_policy: Optional[LWSHealthCheckPolicy.Config] = None
+        enable_tpu_slice_auto_provisioning: Optional[bool] = None
 
     @classmethod
     def set_defaults(cls, fv):
@@ -514,6 +639,12 @@ class GKELeaderWorkerSet(GCPJob):
             "Enable gke_gateway_route with notary-proxy sidecars for direct gateway routing",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "enable_tpu_slice_auto_provisioning",
+            None,
+            "Auto provision TPU slices based on the topology assignment.",
+            **common_kwargs,
+        )
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues, **kwargs):
@@ -532,6 +663,15 @@ class GKELeaderWorkerSet(GCPJob):
         super().__init__(cfg)
         cfg: GKELeaderWorkerSet.Config = self.config
         self._bundler = bundler
+
+        # Pass enable_tpu_slice_auto_provisioning from GKEJob to the builder
+        builder_cfg = cfg.builder
+        if (
+            hasattr(builder_cfg, "enable_tpu_slice_auto_provisioning")
+            and cfg.enable_tpu_slice_auto_provisioning is not None
+        ):
+            builder_cfg.enable_tpu_slice_auto_provisioning = cfg.enable_tpu_slice_auto_provisioning
+
         # This instantiatees a builder for constructing replicated job specs, which will be managed
         # together under the leaderworkerset represented by this class.
         # Note the distinction from bundlers, which are responsible for bundling any code assets
@@ -562,9 +702,42 @@ class GKELeaderWorkerSet(GCPJob):
         """
         cfg: GKELeaderWorkerSet.Config = self.config
         annotations = maybe_instantiate(cfg.annotations or {})
+        labels = maybe_instantiate(cfg.labels or {})
+
+        # If the topology is set and slice auto provisioning is configured
+        # set the necessary annotations
+        topology_assignment = get_topology_assignment()
+        if cfg.enable_tpu_slice_auto_provisioning and topology_assignment:
+            # Add TPU slice selection
+            logging.info("Adding slice selection: %s to leader worker set", topology_assignment)
+
+            # Note, we use async here rather than the jobset sync. Async will immediatly create
+            # the pods before the slice has been created. Once sync is supported for leader worker
+            # set we should consider switching.
+            labels["tpu-provisioner.cloud.google.com/slice-autoprovisioning"] = "async"
+
+            # For Leader worker sets, we only support topology assignments to workers.
+            # The format of the topology assignments (list of subblock groups) is what
+            # is expected by the TPU provisioner.
+            annotations.update(
+                {
+                    "tpu-provisioner.cloud.google.com/slice-selection": json.dumps(
+                        {
+                            "workers": topology_assignment,
+                        }
+                    )
+                }
+            )
+
+            # Remove exclusive topology annotation, the tpu provisioner will ensure replica
+            # affinity by injecting slice based node selectors, so we don't need to use
+            # the exclusive topology annotations
+            exclusive_topology_annotation = exclusive_topology_annotations_leaderworkerset()
+            for key in exclusive_topology_annotation:
+                annotations.pop(key, None)
 
         return dict(
-            metadata=dict(name=cfg.name, annotations=annotations),
+            metadata=dict(name=cfg.name, annotations=annotations, labels=labels),
             spec=dict(
                 replicas=cfg.num_replicas,
                 leaderWorkerTemplate=self._builder(),
